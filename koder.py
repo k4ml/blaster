@@ -32,6 +32,10 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import sys
+import termios
+import tty
+import select
 
 
 # Configuration
@@ -85,6 +89,154 @@ class SessionContext:
     recent_summary: str
 
 
+class EnhancedInput:
+    """Enhanced input function with line editing capabilities"""
+
+    def __init__(self):
+        self.history: List[str] = []
+        self.history_index = 0
+        self.current_line = ""
+        self.cursor_pos = 0
+
+    def _getch(self) -> str:
+        """Get a single character from stdin"""
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(sys.stdin.fileno())
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+
+    def _move_cursor(self, pos: int):
+        """Move cursor to specified position"""
+        sys.stdout.write(f"\r>> {self.current_line}")
+        sys.stdout.write(f"\r>> {self.current_line[:pos]}")
+        sys.stdout.flush()
+        self.cursor_pos = pos
+
+    def _insert_char(self, char: str):
+        """Insert character at current cursor position"""
+        if self.cursor_pos == len(self.current_line):
+            self.current_line += char
+            sys.stdout.write(char)
+        else:
+            self.current_line = (self.current_line[:self.cursor_pos] + char +
+                               self.current_line[self.cursor_pos:])
+            sys.stdout.write(self.current_line[self.cursor_pos:])
+            sys.stdout.write(f"\r>> {self.current_line}")
+            sys.stdout.write(f"\r>> {self.current_line[:self.cursor_pos + 1]}")
+        sys.stdout.flush()
+        self.cursor_pos += 1
+
+    def _delete_char(self):
+        """Delete character at current cursor position"""
+        if self.cursor_pos == 0:
+            return
+        if self.cursor_pos == len(self.current_line):
+            self.current_line = self.current_line[:-1]
+            sys.stdout.write("\b \b")
+        else:
+            self.current_line = (self.current_line[:self.cursor_pos - 1] +
+                               self.current_line[self.cursor_pos:])
+            sys.stdout.write("\b")
+            sys.stdout.write(self.current_line[self.cursor_pos - 1:] + " ")
+            sys.stdout.write(f"\r>> {self.current_line}")
+            sys.stdout.write(f"\r>> {self.current_line[:self.cursor_pos - 1]}")
+        sys.stdout.flush()
+        self.cursor_pos -= 1
+
+    def _clear_line(self):
+        """Clear the current line"""
+        sys.stdout.write("\r>> " + " " * len(self.current_line) + "\r>> ")
+        sys.stdout.flush()
+        self.current_line = ""
+        self.cursor_pos = 0
+
+    def _show_history(self, direction: int):
+        """Show history item (1 for next, -1 for previous)"""
+        if not self.history:
+            return
+
+        if direction == -1:  # Up arrow - previous history
+            if self.history_index == 0:
+                # Save current line when first going to history
+                self.temp_line = self.current_line
+            if self.history_index < len(self.history):
+                self.history_index += 1
+                self.current_line = self.history[-self.history_index]
+        elif direction == 1:  # Down arrow - next history
+            if self.history_index > 1:
+                self.history_index -= 1
+                self.current_line = self.history[-self.history_index]
+            elif self.history_index == 1:
+                self.history_index = 0
+                self.current_line = getattr(self, 'temp_line', '')
+
+        self._clear_line()
+        sys.stdout.write(self.current_line)
+        sys.stdout.flush()
+        self.cursor_pos = len(self.current_line)
+
+    def readline(self, prompt: str = ">> ") -> str:
+        """Read a line with enhanced editing capabilities"""
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+
+        self.current_line = ""
+        self.cursor_pos = 0
+
+        while True:
+            try:
+                char = self._getch()
+
+                # Handle special characters
+                if char == '\x03':  # Ctrl+C
+                    raise KeyboardInterrupt
+                elif char == '\r' or char == '\n':  # Enter
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    line = self.current_line.strip()
+                    if line and (not self.history or self.history[-1] != line):
+                        self.history.append(line)
+                    self.history_index = 0
+                    return line
+                elif char == '\x7f' or char == '\x08':  # Backspace/Delete
+                    self._delete_char()
+                elif char == '\x15':  # Ctrl+U - clear line
+                    self._clear_line()
+                elif char == '\x01':  # Ctrl+A - move to beginning
+                    self._move_cursor(0)
+                elif char == '\x05':  # Ctrl+E - move to end
+                    self._move_cursor(len(self.current_line))
+                elif char == '\x1b':  # Escape sequence (arrows, etc.)
+                    # Read the next two characters
+                    try:
+                        char2 = self._getch()
+                        char3 = self._getch()
+                        if char2 == '[':
+                            if char3 == 'A':  # Up arrow
+                                self._show_history(-1)
+                            elif char3 == 'B':  # Down arrow
+                                self._show_history(1)
+                            elif char3 == 'C':  # Right arrow
+                                if self.cursor_pos < len(self.current_line):
+                                    self._move_cursor(self.cursor_pos + 1)
+                            elif char3 == 'D':  # Left arrow
+                                if self.cursor_pos > 0:
+                                    self._move_cursor(self.cursor_pos - 1)
+                    except:
+                        pass  # Incomplete escape sequence
+                elif char >= ' ':  # Printable character
+                    self._insert_char(char)
+
+            except KeyboardInterrupt:
+                sys.stdout.write("^C\n")
+                sys.stdout.flush()
+                raise
+
+
 class BasicCodingAgent:
     def __init__(self, config: Config = Config()):
         self.config = config
@@ -93,6 +245,7 @@ class BasicCodingAgent:
         self.session_context: Optional[SessionContext] = None
         self.conversation_summary = ""
         self.total_tokens_used = 0
+        self.input_handler = EnhancedInput()
 
         # Setup sessions directory
         self.config.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -526,12 +679,13 @@ Rules:
         print(f"Model: {self.config.model}")
         if self.session_context:
             print(f"Session: {self.session_context.session_id}")
+        print("Enhanced input enabled - Use arrow keys to edit, Ctrl+C to exit")
         print()
 
         while True:
             try:
-                # Get user input
-                user_input = input(">> ").strip()
+                # Get user input with enhanced editing
+                user_input = self.input_handler.readline().strip()
 
                 if user_input.lower() in ['quit', 'exit', 'q']:
                     if self.session_context:
@@ -566,7 +720,7 @@ Rules:
                         for tool_call in tool_calls:
                             tool_name = tool_call.function['name']
                             result = self._execute_tool(tool_call)
-                            
+
                             # Show concise tool results
                             if tool_name == "read_file":
                                 # For read_file, show summary instead of full content
