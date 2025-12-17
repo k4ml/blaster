@@ -11,12 +11,13 @@ This script demonstrates the core principles of a coding agent:
 - Session context management for conversation history
 
 Usage:
-    python basic_coding_agent.py [--model MODEL_NAME] [--session SESSION_NAME] [--load-session]
+    python basic_coding_agent.py [--model MODEL_NAME] [--session SESSION_NAME]
 
-Requirements:
-    - Python 3.7+
-    - OpenAI-compatible API endpoint
-    - OPENAI_API_KEY environment variable
+Changes:
+- Session management: does not automatically load previous sessions on startup
+- Use --session parameter to load a specific session
+- Sessions are automatically saved on quit
+- Fresh session created by default for each new run
 """
 
 import os
@@ -238,7 +239,7 @@ class EnhancedInput:
 
 
 class BasicCodingAgent:
-    def __init__(self, config: Config = Config()):
+    def __init__(self, config: Config = Config(), session_name: Optional[str] = None):
         self.config = config
         self.messages: List[Message] = []
         self.project_root = Path.cwd()
@@ -250,12 +251,35 @@ class BasicCodingAgent:
         # Setup sessions directory
         self.config.sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        # Initialize session if requested
-        if config.session_name:
-            self._load_or_create_session(config.session_name)
+        # Only load session if explicitly requested, otherwise create new session
+        if session_name:
+            self._load_or_create_session(session_name)
+        else:
+            # Create new session without loading previous one
+            session_name = self._generate_session_name()
+            self._create_new_session(session_name)
 
         # Initialize with system prompt
         self._initialize_system_prompt()
+
+    def _generate_session_name(self) -> str:
+        """Generate a session name based on the current project directory"""
+        # Use the directory name as the session name
+        dir_name = self.project_root.name
+
+        # If we're in the home directory or root, use a generic name
+        if dir_name == "" or str(self.project_root) == str(Path.home()):
+            dir_name = "default"
+
+        # Clean the session name (remove special characters)
+        session_name = re.sub(r'[^\w\-_]', '_', dir_name)
+
+        return session_name
+
+    def _auto_create_session(self):
+        """Automatically create or load session based on project directory"""
+        session_name = self._generate_session_name()
+        self._load_or_create_session(session_name)
 
     def _load_or_create_session(self, session_name: str):
         """Load existing session or create new one"""
@@ -266,35 +290,43 @@ class BasicCodingAgent:
                 with open(session_file, 'r', encoding='utf-8') as f:
                     session_data = json.load(f)
 
-                # Load session context
+                # Check if this session is from the same project
                 context_data = session_data.get('context', {})
-                self.session_context = SessionContext(
-                    session_id=context_data.get('session_id', session_name),
-                    created_at=context_data.get('created_at', datetime.now().isoformat()),
-                    last_accessed=datetime.now().isoformat(),
-                    message_count=context_data.get('message_count', 0),
-                    total_tokens=context_data.get('total_tokens', 0),
-                    project_root=str(self.project_root),
-                    recent_summary=context_data.get('recent_summary', '')
-                )
+                saved_project_root = context_data.get('project_root', '')
 
-                # Load conversation summary
-                self.conversation_summary = session_data.get('conversation_summary', '')
-                self.total_tokens_used = session_data.get('total_tokens', 0)
+                if saved_project_root == str(self.project_root):
+                    # Load session context
+                    self.session_context = SessionContext(
+                        session_id=context_data.get('session_id', session_name),
+                        created_at=context_data.get('created_at', datetime.now().isoformat()),
+                        last_accessed=datetime.now().isoformat(),
+                        message_count=context_data.get('message_count', 0),
+                        total_tokens=context_data.get('total_tokens', 0),
+                        project_root=str(self.project_root),
+                        recent_summary=context_data.get('recent_summary', '')
+                    )
 
-                # Load previous messages (limited to recent ones for context)
-                saved_messages = session_data.get('messages', [])
-                if saved_messages:
-                    # Only load last few messages to avoid context overflow
-                    recent_messages = saved_messages[-10:]  # Load last 10 messages
-                    for msg_data in recent_messages:
-                        self.messages.append(Message(
-                            role=msg_data['role'],
-                            content=msg_data['content'],
-                            timestamp=msg_data.get('timestamp')
-                        ))
+                    # Load conversation summary
+                    self.conversation_summary = session_data.get('conversation_summary', '')
+                    self.total_tokens_used = session_data.get('total_tokens', 0)
 
-                print(f"📂 Loaded session '{session_name}' ({len(saved_messages)} previous messages)")
+                    # Load previous messages (limited to recent ones for context)
+                    saved_messages = session_data.get('messages', [])
+                    if saved_messages:
+                        # Only load last few messages to avoid context overflow
+                        recent_messages = saved_messages[-10:]  # Load last 10 messages
+                        for msg_data in recent_messages:
+                            self.messages.append(Message(
+                                role=msg_data['role'],
+                                content=msg_data['content'],
+                                timestamp=msg_data.get('timestamp')
+                            ))
+
+                    print(f"📂 Loaded session '{session_name}' ({len(saved_messages)} previous messages, will be saved on quit)")
+                else:
+                    # Different project, create new session
+                    print(f"📝 New project detected, creating fresh session '{session_name}'")
+                    self._create_new_session(session_name)
 
             except Exception as e:
                 print(f"⚠️  Could not load session: {e}. Starting fresh session.")
@@ -313,7 +345,7 @@ class BasicCodingAgent:
             project_root=str(self.project_root),
             recent_summary=''
         )
-        print(f"📝 Created new session '{session_name}'")
+        print(f"📝 Created new session '{session_name}' (will be saved on quit)")
 
     def _save_session(self):
         """Save current session to disk"""
@@ -678,7 +710,7 @@ Rules:
         print(f"Project: {self.project_root}")
         print(f"Model: {self.config.model}")
         if self.session_context:
-            print(f"Session: {self.session_context.session_id}")
+            print(f"Session: {self.session_context.session_id} (auto-saved)")
         print("Enhanced input enabled - Use arrow keys to edit, Ctrl+C to exit")
         print()
 
@@ -762,8 +794,8 @@ Rules:
 
                     print(f"\n💰 Tokens: {usage['prompt_tokens']} + {usage['completion_tokens']} = {usage['prompt_tokens'] + usage['completion_tokens']} (session: {self.total_tokens_used})")
 
-                    # Auto-save session periodically
-                    if self.session_context and len(self.messages) % 5 == 0:
+                    # Auto-save session after every interaction
+                    if self.session_context:
                         self._save_session()
 
             except KeyboardInterrupt:
@@ -784,9 +816,7 @@ def main():
     parser.add_argument('--model', type=str,
                        help='Specify which model to use (e.g., gpt-4, gpt-3.5-turbo)')
     parser.add_argument('--session', type=str,
-                       help='Specify session name for context persistence')
-    parser.add_argument('--load-session', action='store_true',
-                       help='Load existing session if available')
+                       help='Specify session name to load (otherwise starts fresh session)')
 
     args = parser.parse_args()
 
@@ -802,11 +832,9 @@ def main():
     config = Config()
     if args.model:
         config.model = args.model
-    if args.session:
-        config.session_name = args.session
 
     # Create and run agent
-    agent = BasicCodingAgent(config)
+    agent = BasicCodingAgent(config, args.session)
     agent.run()
 
 
