@@ -359,7 +359,7 @@ class BasicCodingAgent:
                     # Load previous messages (limited to recent ones for context)
                     saved_messages = session_data.get('messages', [])
                     if saved_messages:
-                        recent_messages = saved_messages[-10:]  # Load last 10
+                        recent_messages = saved_messages[-100:]  # Load last 100
                         for msg_data in recent_messages:
                             role = msg_data.get('role', 'user')
                             content = msg_data.get('content', '')
@@ -674,7 +674,10 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         Keeps the system prompt, the most recent N messages, and never splits
         an assistant tool_call block away from the tool results that follow it.
         """
-        MAX_HISTORY = 40
+        # Conversation window sent to the model each turn. 100 matches the
+        # number of messages restored from a saved session, so a resumed
+        # conversation keeps its full history in context.
+        MAX_HISTORY = 100
         if len(messages) <= MAX_HISTORY:
             return messages
         keep = list(messages[-MAX_HISTORY:])
