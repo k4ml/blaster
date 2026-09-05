@@ -44,14 +44,16 @@ import select
 class Config:
     api_base: str = "https://api.openai.com/v1"
     api_base: str = "https://openrouter.ai/api/v1"
+    api_base: str = "http://localhost:11434/v1"
     api_key: str = os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
     model: str = "gpt-4"
     model: str = "nex-agi/deepseek-v3.1-nex-n1:free"
+    model: str = "devstral"
+    model: str = "qwen3.8:27b"
     max_tokens: int = 2000
     temperature: float = 0.2
     max_context_files: int = 20
     max_file_size: int = 100000  # 100KB
-    session_name: Optional[str] = None
     sessions_dir: Path = Path.home() / ".basic_coding_agent" / "sessions"
 
 
@@ -418,16 +420,19 @@ Project Context:
 {session_info}
 
 Available Tools:
-1. read_file(path: str) -> str: Read file content
+1. read_file(path: str) -> str: Read file content. Use this for ANY reference to file content, including phrases like "in file X", "changes in X", "content of X", "examine X", "look at X", "analyze X", "review X", "check X", "inspect X", "show me X", "what's in X", etc.
 2. write_file(path: str, content: str) -> str: Write content to file
 3. list_files(path: str = ".") -> List[str]: List files in directory
 
 Rules:
-- Always use tools when possible instead of suggesting code changes
+- ALWAYS use tools when possible instead of suggesting code changes
+- Be AGGRESSIVE about using read_file tool for ANY file reference
 - Be precise with file paths
 - Handle errors gracefully
 - Ask for clarification if needed
 - Remember the conversation context and build upon previous interactions
+- When a user mentions a specific file in any context, immediately use read_file to examine it
+- For natural language requests about files, prioritize tool usage over direct responses
 """
 
         self.messages.append(Message(role="system", content=system_prompt))
@@ -496,11 +501,11 @@ Rules:
                 "type": "function",
                 "function": {
                     "name": "read_file",
-                    "description": "Read the content of a file",
+                    "description": "Read the content of a file. Use this tool when the user mentions file content, changes in files, or references to specific files that need to be examined. This includes phrases like 'in file X', 'from file X', 'changes in X', 'content of X', 'examine X', 'look at X', 'analyze X', 'review X', 'check X', 'inspect X', 'show me X', 'what's in X', etc.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Path to the file"}
+                            "path": {"type": "string", "description": "Path to the file to read or examine"}
                         },
                         "required": ["path"]
                     }
@@ -510,12 +515,12 @@ Rules:
                 "type": "function",
                 "function": {
                     "name": "write_file",
-                    "description": "Write content to a file",
+                    "description": "Write content to a file. Use this tool when the user wants to create new files, modify existing files, save changes, or write content to specific files.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Path to the file"},
-                            "content": {"type": "string", "description": "Content to write"}
+                            "path": {"type": "string", "description": "Path to the file to write or create"},
+                            "content": {"type": "string", "description": "Content to write to the file"}
                         },
                         "required": ["path", "content"]
                     }
@@ -525,11 +530,11 @@ Rules:
                 "type": "function",
                 "function": {
                     "name": "list_files",
-                    "description": "List files in a directory",
+                    "description": "List files in a directory. Use this tool when the user asks about directory contents, file structure, what files are available, or wants to see the files in a specific directory.",
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "path": {"type": "string", "description": "Directory path"}
+                            "path": {"type": "string", "description": "Directory path to list files from"}
                         },
                         "required": []
                     }
