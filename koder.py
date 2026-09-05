@@ -218,6 +218,25 @@ def _truncate(text: str, limit: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ANSI color helpers
+# ---------------------------------------------------------------------------
+_USE_COLOR = sys.stdout.isatty()
+_CODES = {
+    "red": "\x1b[31m", "green": "\x1b[32m", "yellow": "\x1b[33m",
+    "blue": "\x1b[34m", "cyan": "\x1b[36m", "dim": "\x1b[2m",
+    "bold": "\x1b[1m", "reset": "\x1b[0m",
+}
+
+
+def _c(text: str, style: str = "") -> str:
+    """Wrap text in an ANSI style when stdout is a TTY; no-op otherwise."""
+    code = _CODES.get(style, "")
+    if not _USE_COLOR or not code:
+        return text
+    return f"{code}{text}\x1b[0m"
+
+
+# ---------------------------------------------------------------------------
 # Tool schemas (OpenAI-style function calling)
 # ---------------------------------------------------------------------------
 # (name, description, props, required) — props maps arg name -> (type, desc).
@@ -1049,13 +1068,13 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
 
     def run(self):
         """Main interaction loop"""
-        print("Koder - server ops & coding agent")
-        print(f"Project: {self.project_root}")
-        print(f"Model: {self.config.model}")
-        print(f"API: {self.config.api_base}")
+        print(_c("Koder — server ops & coding agent", "bold"))
+        print(f"  {_c('Project:', 'cyan')} {self.project_root}")
+        print(f"  {_c('Model:', 'cyan')}   {self.config.model}")
+        print(f"  {_c('API:', 'cyan')}     {self.config.api_base}")
         if self.session_context:
-            print(f"Session: {self.session_context.session_id} (auto-saved)")
-        print("Type 'quit' to exit. Ctrl+C to interrupt.")
+            print(f"  {_c('Session:', 'cyan')} {self.session_context.session_id} (auto-saved)")
+        print(_c("Type 'quit' to exit. Ctrl+C to interrupt.", "dim"))
         print()
 
         while True:
@@ -1066,7 +1085,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                 if user_input.lower() in ['quit', 'exit', 'q']:
                     if self.session_context:
                         self._save_session()
-                        print(f"💾 Session '{self.session_context.session_id}' saved")
+                        print(f"💾 {_c('Session saved', 'green')}: {self.session_context.session_id}")
                     break
 
                 if not user_input:
@@ -1082,7 +1101,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                 response = self._call_llm(self.messages)
                 choice = response.choices[0]
                 if not choice:
-                    print("Error: empty response from LLM")
+                    print(_c("Error: empty response from LLM", "red"))
                     continue
 
                 # Tool execution loop: keep feeding results back to the model
@@ -1095,7 +1114,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
 
                     tool_rounds += 1
                     if tool_rounds > 12:
-                        print("⚠️  Too many tool rounds - stopping to avoid a loop.")
+                        print(_c("⚠️  Too many tool rounds - stopping to avoid a loop.", "red"))
                         self.messages.append(Message(
                             role="user",
                             content="(system) Tool round limit reached (12). Stop calling tools and answer now.",
@@ -1104,7 +1123,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                         response = self._call_llm(self.messages)
                         break
 
-                    print(f"\n🔧 Executing {len(tool_calls)} tool(s)...")
+                    print(f"\n🔧 {_c(f'Executing {len(tool_calls)} tool(s)...', 'bold')}")
 
                     # Echo the assistant tool-call message so the model sees
                     # what arguments it used (required before tool results).
@@ -1121,10 +1140,10 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                         self._print_tool_result(tool_name, result)
                         self._add_tool_response(tool_call, result)
 
-                    print("🤖 Getting next response...")
+                    print("🤖 " + _c("Getting next response...", "dim"))
                     response = self._call_llm(self.messages)
                     if not response.choices or not response.choices[0]:
-                        print("Error: empty response from LLM")
+                        print(_c("Error: empty response from LLM", "red"))
                         break
 
                 # Get final response
@@ -1136,14 +1155,14 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                         content=assistant_message,
                         timestamp=datetime.now().isoformat()
                     ))
-                    print(f"\n🤖 {assistant_message}")
+                    print(f"\n🤖 {_c(assistant_message, 'green')}")
 
                 # Update token usage
                 usage = response.usage
                 self.total_tokens_used += usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)
-                print(f"\n💰 Tokens: {usage.get('prompt_tokens', 0)} + {usage.get('completion_tokens', 0)} = "
-                      f"{usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)} "
-                      f"(session: {self.total_tokens_used})")
+                p, c = usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0)
+                print(f"\n💰 {_c(f'Tokens: {p} + {c} = {p + c}', 'dim')}"
+                      f" {_c(f'(session: {self.total_tokens_used})', 'dim')}")
 
                 # Auto-save session after every interaction
                 if self.session_context:
@@ -1152,29 +1171,33 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
             except KeyboardInterrupt:
                 if self.session_context:
                     self._save_session()
-                    print(f"\n💾 Session '{self.session_context.session_id}' saved")
+                    print(f"\n💾 {_c('Session saved', 'green')}: {self.session_context.session_id}")
                 print("Goodbye!")
                 break
             except Exception as e:
-                print(f"Error: {e}")
+                print(_c(f"Error: {e}", "red"))
                 # Don't break on errors, continue the loop
 
     def _print_tool_result(self, tool_name: str, result: str):
         """Show a concise one-line summary of a tool result."""
-        n_lines = result.count('\n') + 1
         preview = result.replace('\n', ' ')[:120]
+        # icon + colored tool name.
         if tool_name == "run_shell":
-            print(f"  💻 {tool_name}: {preview}")
+            head = f"💻 {_c(tool_name, 'cyan')}"
         elif tool_name == "run_interactive":
-            print(f"  🖥️  {tool_name}: {preview}")
-        elif tool_name == "write_file":
-            print(f"  ✏️  {tool_name}: {preview}")
-        elif tool_name == "edit_file":
-            print(f"  ✏️  {tool_name}: {preview}")
+            head = f"🖥️  {_c(tool_name, 'cyan')}"
+        elif tool_name in ("write_file", "edit_file"):
+            head = f"✏️  {_c(tool_name, 'green')}"
         elif tool_name == "list_files":
-            print(f"  📁 {tool_name}: {n_lines} lines")
+            head = f"📁 {_c(tool_name, 'yellow')}"
         else:
-            print(f"  📄 {tool_name}: {n_lines} lines, {len(result)} bytes")
+            head = f"📄 {_c(tool_name, 'yellow')}"
+
+        if tool_name in ("run_shell", "run_interactive"):
+            body = _c(preview, "dim")
+            print(f"  {head}: {body}")
+        else:
+            print(f"  {head}: {preview}")
 
 
 def main():
