@@ -363,6 +363,10 @@ class BasicCodingAgent:
                         for msg_data in recent_messages:
                             role = msg_data.get('role', 'user')
                             content = msg_data.get('content', '')
+                            if role == 'system':
+                                # The saved file carries the old system prompt;
+                                # a fresh one is added when the agent starts.
+                                continue
                             if role == 'tool':
                                 # Persisted tool messages carry the call id in
                                 # the timestamp slot of older sessions; just
@@ -1069,6 +1073,28 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         except Exception as e:
             return f"Error running interactive command: {e}"
 
+    def _show_past_messages(self):
+        """Recap the restored conversation so the user sees prior context.
+
+        Message sequence in self.messages: [system, ...past turns...].
+        Tool messages are the model's internal read/write/shell results; skip
+        them and the synthetic echo messages to keep the recap readable.
+        """
+        past = [m for m in self.messages if m.role in ("user", "assistant")
+                and m.content]
+        if len(past) <= 1:
+            return  # nothing restored (just the system prompt)
+
+        n = len(past) - 1  # exclude the (empty) initial context
+        print(_c(f"\n— previous conversation ({n} messages) —", "dim"))
+        for m in past:
+            who = _c("you", "cyan") if m.role == "user" else _c("koder", "green")
+            text = m.content.strip().replace("\n", " ")
+            if len(text) > 300:
+                text = text[:300] + "…"
+            print(f"  {who}: {text}")
+        print(_c("— end of previous conversation —", "dim"))
+
     def run(self):
         """Main interaction loop"""
         print(_c("Koder — server ops & coding agent", "bold"))
@@ -1078,6 +1104,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         if self.session_context:
             print(f"  {_c('Session:', 'cyan')} {self.session_context.session_id} (auto-saved)")
         print(_c("Type 'quit' to exit. Ctrl+C to interrupt.", "dim"))
+        self._show_past_messages()
         print()
 
         while True:
