@@ -1200,6 +1200,35 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
             print(f"  {head}: {preview}")
 
 
+def _show_sessions(sessions_dir: Path) -> None:
+    """List saved sessions (most recently used first)."""
+    files = sorted(sessions_dir.glob("*.json"),
+                   key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        print(_c("No saved sessions.", "yellow"))
+        print(f"(sessions are stored in {sessions_dir})")
+        return
+
+    hdr = (f"{_c('SESSION', 'bold'):<22} {_c('MSGS', 'bold'):>5}  "
+           f"{_c('CREATED', 'bold'):<10}  {_c('LAST USED', 'bold'):<10}  "
+           f"{_c('PROJECT', 'bold')}")
+    print(hdr)
+    print("-" * len(hdr))
+    for f in files:
+        try:
+            ctx = json.loads(f.read_text(encoding="utf-8")).get("context", {})
+            name = ctx.get("session_id", f.stem)
+            msgs = ctx.get("message_count", "?")
+            created = (ctx.get("created_at") or "?")[:10]
+            last = (ctx.get("last_accessed") or "?")[:10]
+            proj = ctx.get("project_root", "?")
+        except Exception:
+            name, msgs, created, last, proj = f.stem, "?", "?", "?", "?"
+        print(f"{name:<22} {str(msgs):>5}  {created:<10}  {last:<10}  {proj}")
+    print()
+    print(_c("Resume one with: python koder.py --session NAME", "dim"))
+
+
 def main():
     """Entry point"""
     parser = argparse.ArgumentParser(
@@ -1208,12 +1237,16 @@ def main():
                         help='Model name (default: KODER_MODEL or qwen3.8:27b)')
     parser.add_argument('--api-base', dest='api_base_cli', type=str,
                         help='OpenAI-compatible API base, e.g. http://localhost:11434/v1')
-    parser.add_argument('--session', type=str,
-                        help='Session name to load (default: fresh session per directory)')
+    parser.add_argument('--session', type=str, nargs='?', const='__list__', default=None,
+                        help='Session name to load; bare --session lists saved sessions')
     parser.add_argument('--cwd', type=str, default=None,
                         help='Working directory for tools (default: current dir)')
 
     args = parser.parse_args()
+
+    if args.session == '__list__':
+        _show_sessions(Config().sessions_dir)
+        return
 
     # Config: CLI flag > KODER_API_BASE env > local Ollama default. API key is
     # optional because local endpoints (Ollama) usually need none.
