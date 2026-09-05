@@ -1,60 +1,88 @@
 #!/usr/bin/env python3
 """
-Basic Coding Agent - Single file implementation using only standard library
+Koder - Single-file server operations & coding agent using only stdlib.
 
-This script demonstrates the core principles of a coding agent:
-- Takes user prompts
-- Provides project context
-- Allows file reading/writing
-- Uses OpenAI-compatible API for LLM calls
-- Implements basic tool usage pattern
-- Session context management for conversation history
+Turns natural language into server-admin and coding actions on the host it
+runs on: inspect files/dirs, run shell commands, install/configure services,
+edit configs, and check service state. It uses any OpenAI-compatible chat
+completions endpoint (Ollama / llama.cpp / OpenRouter / OpenAI / etc.).
+
+Tools (used via OpenAI-style function calling):
+  read_file      - read a file (truncated if large)
+  write_file     - create/overwrite a file
+  edit_file      - apply a before/after string replacement to a file
+  list_files     - list a directory tree
+  run_shell      - run a shell command, capture stdout/stderr/exit code
+  run_interactive- run an interactive program (editor/pager/dialog)
+
+Safety:
+  - Destructive shell commands (rm -rf, mkfs, dd, ...) require y/N approval.
+  - Commands containing "sudo" require y/N approval.
+  - run_shell output is capped so a runaway command cannot flood the context.
 
 Usage:
-    python basic_coding_agent.py [--model MODEL_NAME] [--session SESSION_NAME]
+    python koder.py [--model qwen3.8:27b] [--session NAME]
+                    [--api-base http://localhost:11434/v1] [--cwd DIR]
 
-Changes:
-- Session management: does not automatically load previous sessions on startup
-- Use --session parameter to load a specific session
-- Sessions are automatically saved on quit
-- Fresh session created by default for each new run
+    # Local models via Ollama (no API key needed)
+    python koder.py
+
+    # Remote OpenAI-compatible provider
+    OPENAI_API_KEY=sk-... python koder.py --api-base https://openrouter.ai/api/v1 \
+        --model openai/gpt-4o
+
+Environment:
+    KODER_MODEL, KODER_API_BASE   overrides for model / endpoint
+    OPENAI_API_KEY                used when the endpoint requires a key
 """
 
 import os
 import json
 import re
+import subprocess
 import urllib.request
 import urllib.error
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-import tempfile
+from typing import List, Dict, Any, Optional
 import shutil
 from dataclasses import dataclass
 from datetime import datetime
-import hashlib
 import sys
 import termios
 import tty
-import select
 
 
 # Configuration
 @dataclass
 class Config:
-    api_base: str = "https://api.openai.com/v1"
-    api_base: str = "https://openrouter.ai/api/v1"
-    api_base: str = "http://localhost:11434/v1"
-    api_key: str = os.getenv("OPENAI_API_KEY", "") or os.getenv("OPENROUTER_API_KEY", "")
-    model: str = "gpt-4"
-    model: str = "nex-agi/deepseek-v3.1-nex-n1:free"
-    model: str = "devstral"
-    model: str = "qwen3.8:27b"
+    # Default to a local Ollama endpoint; override with --api-base / KODER_API_BASE.
+    api_base: str = os.getenv("KODER_API_BASE", "http://localhost:11434/v1")
+    api_key: str = os.getenv("OPENAI_API_KEY", "")
+    model: str = os.getenv("KODER_MODEL", "qwen3.8:27b")
     max_tokens: int = 2000
     temperature: float = 0.2
+    request_timeout: int = 120
     max_context_files: int = 20
-    max_file_size: int = 100000  # 100KB
-    sessions_dir: Path = Path.home() / ".basic_coding_agent" / "sessions"
+    max_file_size: int = 100000          # 100KB cap for read_file
+    max_output_chars: int = 40000         # cap for run_shell stdout+stderr
+    sessions_dir: Path = Path.home() / ".koder" / "sessions"
+    cwd: Path = Path.cwd()
+
+
+# Regexes for commands that need explicit approval. Operate on the raw command
+# string (whole-word) so plain uses like `grep -r rm /etc` are not flagged.
+DESTRUCTIVE_PATTERNS = [
+    r"\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+",   # rm -r / rm -f / rm -rf
+    r"\bmkfs(?:\.[a-z0-9]+)?\b",
+    r"\bdd\b",
+    r"\bmkswap\b|\bswapoff\b",
+    r"\bparted\b|\bfdisk\b|\bsfdisk\b",
+    r"\bkill\s+-9\b|\bpkill\s+-9\b",
+    r"\bgit\s+push\s+(-f|--force)\b",
+    r"\bmv\s+/\s+",
+]
+SUDO_PATTERN = re.compile(r"(^|[;&|]\s*)sudo\s+")
 
 
 # Data structures
@@ -87,9 +115,27 @@ class SessionContext:
     created_at: str
     last_accessed: str
     message_count: int
-    total_tokens: int
-    project_root: str
-    recent_summary: str
+
+
+@dataclass
+class BashToolResult:
+    """Result of a run_shell / run_interactive execution."""
+    stdout: str = ""
+    stderr: str = ""
+    exit_code: int = 0
+    timed_out: bool = False
+
+    def format(self) -> str:
+        """Format for the LLM: stdout then stderr, with exit code."""
+        parts = []
+        if self.stdout:
+            parts.append(self.stdout.rstrip("\n"))
+        if self.stderr:
+            parts.append(f"[stderr]\n{self.stderr.rstrip(chr(10))}")
+        parts.append(f"[exit code: {self.exit_code}]")
+        if self.timed_out:
+            parts.append("[command timed out and was terminated]")
+        return "\n".join(parts)
 
 
 class EnhancedInput:
@@ -184,6 +230,19 @@ class EnhancedInput:
 
     def readline(self, prompt: str = ">> ") -> str:
         """Read a line with enhanced editing capabilities"""
+        # Fall back to plain input() when stdin is not a TTY (piped/scripted),
+        # since termios/tty raw mode needs an interactive terminal.
+        if not sys.stdin.isatty():
+            try:
+                line = input(prompt)
+            except EOFError:
+                raise KeyboardInterrupt
+            line = line.strip()
+            if line and (not self.history or self.history[-1] != line):
+                self.history.append(line)
+            self.history_index = 0
+            return line
+
         sys.stdout.write(prompt)
         sys.stdout.flush()
 
@@ -240,11 +299,181 @@ class EnhancedInput:
                 raise
 
 
+# ---------------------------------------------------------------------------
+# Tool schemas advertised to the model (OpenAI-style function calling)
+# ---------------------------------------------------------------------------
+
+def _get_tools() -> List[Dict]:
+    """Return the JSON schema for every tool the model can call."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": (
+                    "Read a file's content. Use this when the user asks about a "
+                    "file, config, log, or any file content."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file, absolute or relative to cwd",
+                        }
+                    },
+                    "required": ["path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": (
+                    "Create a new file or overwrite an existing file with content."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file, absolute or relative to cwd",
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "Full new content of the file",
+                        },
+                    },
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "edit_file",
+                "description": (
+                    "Edit an existing file by replacing a unique substring (before) "
+                    "with new text (after). A backup is made automatically."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Path to the file, absolute or relative to cwd",
+                        },
+                        "before": {
+                            "type": "string",
+                            "description": "Exact existing text to find (must be unique)",
+                        },
+                        "after": {
+                            "type": "string",
+                            "description": "Replacement text",
+                        },
+                    },
+                    "required": ["path", "before", "after"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_files",
+                "description": (
+                    "List files and directories under a path (non-recursive by "
+                    "default; pass recursive=true for a tree)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Directory to list, default '.'",
+                        },
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "List recursively as a tree",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_shell",
+                "description": (
+                    "Run a shell command (bash -c) on this machine and return its "
+                    "stdout/stderr and exit code. Use for server ops: service "
+                    "status, logs, package installs, process checks, systemctl, "
+                    "docker, disk usage, network, etc. Destructive or sudo "
+                    "commands require the user's y/N approval before running."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to run",
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Seconds to wait before killing (default 30)",
+                        },
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_interactive",
+                "description": (
+                    "Run an interactive terminal program (editor, pager, dialog, "
+                    "top, etc.). Output is not captured; use for things that need "
+                    "a TTY and user interaction."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "Command to run interactively",
+                        },
+                    },
+                    "required": ["command"],
+                },
+            },
+        },
+    ]
+
+
+def _truncate(text: str, limit: int) -> str:
+    """Truncate text to limit chars, keeping whole lines, with a marker."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    # Drop the possibly-partial last line for cleanliness.
+    if "\n" in cut:
+        cut = cut.rsplit("\n", 1)[0]
+    return f"{cut}\n... [output truncated, {len(text) - len(cut)} more chars]"
+
+
 class BasicCodingAgent:
     def __init__(self, config: Config = Config(), session_name: Optional[str] = None):
         self.config = config
         self.messages: List[Message] = []
-        self.project_root = Path.cwd()
+        # Once a dangerous/sudo command is declined, block further attempts in
+        # this session so the model cannot silently retry it.
+        self._declined_commands: List[str] = []
+        # Working directory for all tools (files + shell). Defaults to the
+        # launch directory; --cwd overrides it.
+        self.project_root = config.cwd.resolve()
+        self.project_root.mkdir(parents=True, exist_ok=True)
         self.session_context: Optional[SessionContext] = None
         self.conversation_summary = ""
         self.total_tokens_used = 0
@@ -303,9 +532,6 @@ class BasicCodingAgent:
                         created_at=context_data.get('created_at', datetime.now().isoformat()),
                         last_accessed=datetime.now().isoformat(),
                         message_count=context_data.get('message_count', 0),
-                        total_tokens=context_data.get('total_tokens', 0),
-                        project_root=str(self.project_root),
-                        recent_summary=context_data.get('recent_summary', '')
                     )
 
                     # Load conversation summary
@@ -315,14 +541,28 @@ class BasicCodingAgent:
                     # Load previous messages (limited to recent ones for context)
                     saved_messages = session_data.get('messages', [])
                     if saved_messages:
-                        # Only load last few messages to avoid context overflow
-                        recent_messages = saved_messages[-10:]  # Load last 10 messages
+                        recent_messages = saved_messages[-10:]  # Load last 10
                         for msg_data in recent_messages:
-                            self.messages.append(Message(
-                                role=msg_data['role'],
-                                content=msg_data['content'],
-                                timestamp=msg_data.get('timestamp')
-                            ))
+                            role = msg_data.get('role', 'user')
+                            content = msg_data.get('content', '')
+                            if role == 'tool':
+                                # Persisted tool messages carry the call id in
+                                # the timestamp slot of older sessions; just
+                                # synthesize a placeholder name so reloading
+                                # produces a well-formed tool result.
+                                self.messages.append(Message(
+                                    role='tool',
+                                    content=content,
+                                    tool_call_id=msg_data.get('tool_call_id', 'legacy'),
+                                    name=msg_data.get('name', 'tool'),
+                                    timestamp=msg_data.get('timestamp')
+                                ))
+                            else:
+                                self.messages.append(Message(
+                                    role=role,
+                                    content=content,
+                                    timestamp=msg_data.get('timestamp')
+                                ))
 
                     print(f"📂 Loaded session '{session_name}' ({len(saved_messages)} previous messages, will be saved on quit)")
                 else:
@@ -343,9 +583,6 @@ class BasicCodingAgent:
             created_at=datetime.now().isoformat(),
             last_accessed=datetime.now().isoformat(),
             message_count=0,
-            total_tokens=0,
-            project_root=str(self.project_root),
-            recent_summary=''
         )
         print(f"📝 Created new session '{session_name}' (will be saved on quit)")
 
@@ -360,8 +597,6 @@ class BasicCodingAgent:
             # Update session context
             self.session_context.last_accessed = datetime.now().isoformat()
             self.session_context.message_count = len(self.messages)
-            self.session_context.total_tokens = self.total_tokens_used
-            self.session_context.recent_summary = self._generate_conversation_summary()
 
             # Prepare session data
             session_data = {
@@ -370,9 +605,7 @@ class BasicCodingAgent:
                     'created_at': self.session_context.created_at,
                     'last_accessed': self.session_context.last_accessed,
                     'message_count': self.session_context.message_count,
-                    'total_tokens': self.session_context.total_tokens,
-                    'project_root': self.session_context.project_root,
-                    'recent_summary': self.session_context.recent_summary
+                    'project_root': str(self.project_root),
                 },
                 'conversation_summary': self.conversation_summary,
                 'total_tokens': self.total_tokens_used,
@@ -380,7 +613,9 @@ class BasicCodingAgent:
                     {
                         'role': msg.role,
                         'content': msg.content,
-                        'timestamp': msg.timestamp or datetime.now().isoformat()
+                        'timestamp': msg.timestamp or datetime.now().isoformat(),
+                        'tool_call_id': msg.tool_call_id,
+                        'name': msg.name,
                     }
                     for msg in self.messages
                 ]
@@ -408,33 +643,32 @@ class BasicCodingAgent:
         return " | ".join(recent_exchanges[-3:])  # Last 3 exchanges
 
     def _initialize_system_prompt(self):
-        """Create system prompt with project and session context"""
+        """Create system prompt with tool rules and session context"""
         project_info = self._get_project_info()
         session_info = self._get_session_info()
 
-        system_prompt = f"""You are a coding assistant helping with a Python project.
+        system_prompt = f"""You are Koder, a server operations and coding assistant running directly on this machine. You help set up, maintain, configure, and debug servers and code, and you execute actions via tools.
 
-Project Context:
+You operate in the working directory: {self.project_root}
+The current date is {datetime.now().strftime('%Y-%m-%d')}.
+
 {project_info}
 
 {session_info}
 
-Available Tools:
-1. read_file(path: str) -> str: Read file content. Use this for ANY reference to file content, including phrases like "in file X", "changes in X", "content of X", "examine X", "look at X", "analyze X", "review X", "check X", "inspect X", "show me X", "what's in X", etc.
-2. write_file(path: str, content: str) -> str: Write content to file
-3. list_files(path: str = ".") -> List[str]: List files in directory
+TOOL USE RULES (critical):
+- Prefer using tools over merely describing what to do. You can actually change the system.
+- Before reading or editing a file, run_shell 'ls' / read_file to see what exists. If an edit_file 'before' string is rejected, read the file to get exact content.
+- run_shell output is returned to you verbatim (capped). Use exit codes to judge success. For long-running commands pass a generous timeout.
+- When a command fails, inspect the error and try to fix it yourself (check logs, configs, dependencies) before giving up.
+- Commands flagged as destructive (rm -rf, mkfs, dd, git push -f, etc.) or any command using sudo will prompt the user for y/N approval. If approval is declined, do NOT retry the same command; explain and offer a safer alternative.
+- run_interactive starts a program on the user's terminal (editors, top, etc.); the user operates it directly. Prefer run_shell for anything that can run non-interactively.
+- Ask before making large or irreversible changes you cannot verify (e.g. deleting data, wiping disks, changing firewall rules). For routine config edits and service restarts, just proceed.
+- Keep responses concise. Summarize what you changed and the resulting state.
 
-Rules:
-- ALWAYS use tools when possible instead of suggesting code changes
-- Be AGGRESSIVE about using read_file tool for ANY file reference
-- Be precise with file paths
-- Handle errors gracefully
-- Ask for clarification if needed
-- Remember the conversation context and build upon previous interactions
-- When a user mentions a specific file in any context, immediately use read_file to examine it
-- For natural language requests about files, prioritize tool usage over direct responses
+You can call the following tools (schemas are sent with each request):
+read_file, write_file, edit_file, list_files, run_shell, run_interactive
 """
-
         self.messages.append(Message(role="system", content=system_prompt))
 
     def _get_session_info(self) -> str:
@@ -443,11 +677,9 @@ Rules:
             return ""
 
         session_info = []
-        session_info.append(f"Session Context:")
+        session_info.append("Session Context:")
         session_info.append(f"  Session: {self.session_context.session_id}")
         session_info.append(f"  Created: {self.session_context.created_at.split('T')[0]}")
-        session_info.append(f"  Messages: {self.session_context.message_count}")
-        session_info.append(f"  Total Tokens: {self.session_context.total_tokens}")
 
         if self.conversation_summary:
             session_info.append(f"  Recent: {self.conversation_summary}")
@@ -455,124 +687,206 @@ Rules:
         return "\n".join(session_info)
 
     def _get_project_info(self) -> str:
-        """Get basic project information"""
+        """Get basic information about the working directory"""
         info = []
 
-        # Project structure
+        # Working directory listing
         try:
+            entries = sorted(self.project_root.iterdir(),
+                             key=lambda p: (not p.is_dir(), p.name.lower()))
             files = []
-            for item in self.project_root.iterdir():
-                if item.is_file() and item.suffix in ['.py', '.md', '.txt', '.json']:
+            for item in entries[:self.config.max_context_files]:
+                if item.is_file():
                     files.append(f"  - {item.name}")
-                elif item.is_dir() and not item.name.startswith('.'):
+                elif item.is_dir():
                     files.append(f"  - {item.name}/")
-
-            if files:
-                info.append("Project Structure:")
-                info.extend(files[:self.config.max_context_files])
+            if entries:
+                info.append("Working directory contents (top-level):")
+                info.extend(files)
+            else:
+                info.append("Working directory is empty.")
         except Exception as e:
-            info.append(f"Could not read project structure: {e}")
+            info.append(f"Could not read working directory: {e}")
 
         # Git info if available
         try:
             if (self.project_root / ".git").exists():
-                info.append("\nGit Repository: Yes")
-        except:
+                info.append("\nThis is a git repository.")
+        except Exception:
             pass
 
-        return "\n".join(info) if info else "No project context available"
+        return "\n".join(info)
 
     def _call_llm(self, messages: List[Message]) -> LLMResponse:
-        """Call OpenAI-compatible API"""
-        if not self.config.api_key:
-            raise ValueError("OPENAI_API_KEY environment variable not set")
+        """Call an OpenAI-compatible chat completions endpoint.
 
-        # Prepare request
-        payload = {
+        Uses the local Ollama-style /chat/completions JSON API. Sends the
+        `tools` array only when the tail of the conversation actually contains
+        tool calls (or a system prompt that references them), which keeps the
+        prompt smaller and lets local models behave. Parses a non-streamed JSON
+        response; if the server returns NDJSON streaming deltas it reads them
+        and reassembles a normal-looking response object.
+        """
+        if not self.config.api_key:
+            # Local endpoints (Ollama) accept an empty key; remote providers
+            # require one. Only raise if the endpoint does not look local.
+            if "localhost" not in self.config.api_base and "127.0.0.1" not in self.config.api_base:
+                raise ValueError(
+                    "API key required for non-local endpoint. Set OPENAI_API_KEY.")
+
+        # Trim the oldest messages so a long session cannot overflow the
+        # model's context window.
+        history = self._trim_messages(messages)
+
+        need_tools = self._conversation_needs_tools(history)
+        payload: Dict[str, Any] = {
             "model": self.config.model,
-            "messages": [self._message_to_dict(msg) for msg in messages],
+            "messages": [self._message_to_dict(msg) for msg in history],
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
         }
-
-        # Add tools if needed
-        tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "description": "Read the content of a file. Use this tool when the user mentions file content, changes in files, or references to specific files that need to be examined. This includes phrases like 'in file X', 'from file X', 'changes in X', 'content of X', 'examine X', 'look at X', 'analyze X', 'review X', 'check X', 'inspect X', 'show me X', 'what's in X', etc.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Path to the file to read or examine"}
-                        },
-                        "required": ["path"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "write_file",
-                    "description": "Write content to a file. Use this tool when the user wants to create new files, modify existing files, save changes, or write content to specific files.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Path to the file to write or create"},
-                            "content": {"type": "string", "description": "Content to write to the file"}
-                        },
-                        "required": ["path", "content"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "list_files",
-                    "description": "List files in a directory. Use this tool when the user asks about directory contents, file structure, what files are available, or wants to see the files in a specific directory.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Directory path to list files from"}
-                        },
-                        "required": []
-                    }
-                }
-            }
-        ]
-
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
+        if need_tools:
+            payload["tools"] = _get_tools()
+            payload["tool_choice"] = "auto"
 
         # Make HTTP request
-        url = f"{self.config.api_base}/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.config.api_key}"
-        }
+        url = f"{self.config.api_base.rstrip('/')}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
 
-        req = urllib.request.Request(url,
-                                    data=json.dumps(payload).encode('utf-8'),
-                                    headers=headers,
-                                    method='POST')
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                return LLMResponse(
-                    choices=data.get('choices', []),
-                    usage=data.get('usage', {'prompt_tokens': 0, 'completion_tokens': 0})
-                )
+            with urllib.request.urlopen(req, timeout=self.config.request_timeout) as response:
+                ctype = response.headers.get("Content-Type", "")
+                raw = response.read()
         except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8') if e.fp else str(e)
+            error_body = e.read().decode("utf-8", "replace") if e.fp else str(e)
             raise Exception(f"API Error {e.code}: {error_body}")
         except Exception as e:
             raise Exception(f"Request failed: {e}")
 
+        try:
+            text = raw.decode("utf-8", "replace")
+        except Exception:
+            text = ""
+
+        if "application/x-ndjson" in ctype or text.lstrip().startswith("{"):
+            # Non-streamed: parse the single JSON object (or an NDJSON doc).
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                # Streaming fallback: server returned NDJSON lines.
+                data = self._parse_streaming_ndjson(text)
+            if data.get("error"):
+                raise Exception(f"API error: {data['error']}")
+            return LLMResponse(
+                choices=data.get("choices", []),
+                usage=data.get("usage",
+                               {"prompt_tokens": 0, "completion_tokens": 0})
+            )
+
+        # Otherwise treat the body as NDJSON streaming chunks.
+        data = self._parse_streaming_ndjson(text)
+        if not data.get("choices"):
+            raise Exception(f"Empty/unexpected API response: {text[:500]}")
+        return LLMResponse(choices=data["choices"], usage=data.get("usage", {
+            "prompt_tokens": 0, "completion_tokens": 0}))
+
+    def _parse_streaming_ndjson(self, text: str) -> Dict:
+        """Reassemble an OpenAI-style response from NDJSON stream chunks."""
+        content_parts: List[str] = []
+        tool_calls_acc: Dict[str, Dict[str, Any]] = {}
+        finish_reason = None
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or not line.startswith("data:"):
+                continue
+            data_str = line[len("data:"):].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                chunk = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            if not chunk.get("choices"):
+                if chunk.get("usage"):
+                    usage = chunk.get("usage")
+                continue
+            delta = chunk["choices"][0].get("delta", {})
+            if delta.get("content"):
+                content_parts.append(delta["content"])
+            for tc in delta.get("tool_calls", []) or []:
+                idx = tc.get("index", 0)
+                acc = tool_calls_acc.setdefault(
+                    idx, {"id": "", "type": "function",
+                          "function": {"name": "", "arguments": ""}})
+                if tc.get("id"):
+                    acc["id"] = tc["id"]
+                fn = tc.get("function", {}) or {}
+                if fn.get("name"):
+                    acc["function"]["name"] += fn["name"]
+                if fn.get("arguments"):
+                    acc["function"]["arguments"] += fn["arguments"]
+            if chunk["choices"][0].get("finish_reason"):
+                finish_reason = chunk["choices"][0]["finish_reason"]
+
+        message: Dict[str, Any] = {}
+        if content_parts:
+            message["content"] = "".join(content_parts)
+        if tool_calls_acc:
+            message["tool_calls"] = [
+                tool_calls_acc[k] for k in sorted(tool_calls_acc)]
+        # Filter out chunks that were only usage / keep a stable shape.
+        return {
+            "choices": [{
+                "message": message,
+                "finish_reason": finish_reason,
+            }],
+            "usage": usage,
+        }
+
+    def _trim_messages(self, messages: List[Message]) -> List[Message]:
+        """Drop the oldest messages once the conversation grows too long.
+
+        Keeps the system prompt, the most recent N messages, and never splits
+        an assistant tool_call block away from the tool results that follow it.
+        """
+        MAX_HISTORY = 40
+        if len(messages) <= MAX_HISTORY:
+            return messages
+        keep = list(messages[-MAX_HISTORY:])
+        # If the first kept message is a tool result, its assistant tool_call
+        # predecessor was dropped; walk forward until we find a non-tool
+        # message so the block is well-formed.
+        while keep and keep[0].role == "tool":
+            keep.pop(0)
+        # Ensure the system prompt is always present.
+        if keep and keep[0].role != "system":
+            keep.insert(0, messages[0])
+        return keep
+
+    def _conversation_needs_tools(self, history: List[Message]) -> bool:
+        """True if the request should advertise the tool schema.
+
+        We advertise tools when the last user/assistant turn happened, i.e.
+        whenever the tail of the conversation might still trigger a tool call.
+        Returning False keeps the prompt small when only a plain answer is
+        expected (e.g. a summary after a long command), but risks a local
+        model answering instead of calling a tool it was never told about.
+        """
+        if len(history) >= 2:
+            return True
+        # Fresh session with just the system prompt: tools should be available.
+        return any("Available Tools" in (m.content or "") for m in history[:1])
+
     def _message_to_dict(self, message: Message) -> Dict:
         """Convert Message to dict for API"""
-        result = {
+        result: Dict[str, Any] = {
             "role": message.role,
             "content": message.content
         }
@@ -630,9 +944,25 @@ Rules:
                 content = args_dict.get('content', '')
                 return self._write_file(path, content)
 
+            elif tool_name == "edit_file":
+                path = args_dict.get('path', '')
+                before = args_dict.get('before', '')
+                after = args_dict.get('after', '')
+                return self._edit_file(path, before, after)
+
             elif tool_name == "list_files":
                 path = args_dict.get('path', '.')
-                return self._list_files(path)
+                recursive = args_dict.get('recursive', False)
+                return self._list_files(path, recursive)
+
+            elif tool_name == "run_shell":
+                command = args_dict.get('command', '')
+                timeout = int(args_dict.get('timeout', 30))
+                return self._run_shell(command, timeout=timeout)
+
+            elif tool_name == "run_interactive":
+                command = args_dict.get('command', '')
+                return self._run_interactive(command)
 
             else:
                 return f"Error: Unknown tool {tool_name}"
@@ -641,60 +971,143 @@ Rules:
             return f"Error executing {tool_name}: {e}"
 
     def _read_file(self, path: str) -> str:
-        """Read file content"""
+        """Read file content (truncated to max_file_size)"""
         file_path = self._resolve_path(path)
 
-        # Check file size
+        if not file_path.exists():
+            return f"Error: File not found: {file_path}"
+        if file_path.is_dir():
+            return f"Error: {file_path} is a directory, not a file"
+
         file_size = file_path.stat().st_size
         if file_size > self.config.max_file_size:
-            return f"Error: File too large ({file_size} bytes, max {self.config.max_file_size})"
+            return (f"Error: File too large ({file_size} bytes, "
+                    f"max {self.config.max_file_size})")
 
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                return f.read()
+                content = f.read()
+        except UnicodeDecodeError:
+            return (f"Error: {file_path} is not valid UTF-8 text "
+                    f"({file_size} bytes); use run_shell to inspect it")
         except Exception as e:
             return f"Error reading file: {e}"
 
+        return f"--- {file_path} ---\n{content}\n--- end {file_path} ---"
+
     def _write_file(self, path: str, content: str) -> str:
-        """Write content to file"""
+        """Write content to file, creating a .bak backup if the file exists"""
         file_path = self._resolve_path(path)
 
-        # Create backup
+        # Create backup if the file already exists
         backup_path = file_path.with_suffix(file_path.suffix + '.bak')
         if file_path.exists():
+            try:
+                shutil.copy2(file_path, backup_path)
+            except Exception as e:
+                return f"Error backing up existing file: {e}"
+
+        try:
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+        except Exception as e:
+            return f"Error writing file: {e}"
+
+        msg = f"Successfully wrote {len(content)} bytes to {file_path}"
+        if backup_path.exists():
+            msg += f" (backup: {backup_path.name})"
+        return msg
+
+    def _edit_file(self, path: str, before: str, after: str) -> str:
+        """Edit a file by replacing a unique substring."""
+        file_path = self._resolve_path(path)
+        if not file_path.exists():
+            return f"Error: File not found: {file_path}"
+        if file_path.is_dir():
+            return f"Error: {file_path} is a directory"
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+        except Exception as e:
+            return f"Error reading file: {e}"
+
+        if before not in content:
+            return (f"Error: 'before' text not found in {file_path}. "
+                    f"Use read_file to get the exact current content first.")
+        if content.count(before) > 1:
+            return (f"Error: 'before' text is not unique in {file_path} "
+                    f"({content.count(before)} matches). Include more context.")
+
+        new_content = content.replace(before, after, 1)
+        backup_path = file_path.with_suffix(file_path.suffix + '.bak')
+        try:
             shutil.copy2(file_path, backup_path)
+        except Exception as e:
+            return f"Error backing up existing file: {e}"
 
         try:
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(content)
-            return f"Successfully wrote {len(content)} bytes to {file_path}"
+                f.write(new_content)
         except Exception as e:
-            # Restore backup if write failed
-            if backup_path.exists():
-                shutil.copy2(backup_path, file_path)
+            shutil.copy2(backup_path, file_path)
             return f"Error writing file: {e}"
 
-    def _list_files(self, path: str = ".") -> str:
-        """List files in directory"""
+        return (f"Successfully edited {file_path} "
+                f"({len(before)} chars replaced, backup: {backup_path.name})")
+
+    def _list_files(self, path: str = ".", recursive: bool = False) -> str:
+        """List files in a directory, optionally as a recursive tree"""
         dir_path = self._resolve_path(path)
 
         if not dir_path.is_dir():
             return f"Error: {dir_path} is not a directory"
 
         try:
-            files = []
-            for item in dir_path.iterdir():
-                if item.is_file():
-                    files.append(f"  - {item.name} ({item.stat().st_size} bytes)")
-                elif item.is_dir():
-                    files.append(f"  - {item.name}/")
+            if not recursive:
+                files = []
+                for item in sorted(dir_path.iterdir()):
+                    if item.is_file():
+                        files.append(f"  - {item.name} ({item.stat().st_size} bytes)")
+                    elif item.is_dir():
+                        files.append(f"  - {item.name}/")
+                return f"Files in {dir_path}:\n" + "\n".join(files)
 
-            return "Files:\n" + "\n".join(sorted(files))
+            # Recursive tree with depth limit to avoid flooding context.
+            lines = [f"{dir_path}/"]
+
+            def _walk(d: Path, prefix: str, depth: int, count: List[int]):
+                if count[0] >= 500:
+                    lines.append(f"{prefix}... [too many entries]")
+                    return
+                entries = sorted(d.iterdir(),
+                                 key=lambda p: (not p.is_dir(), p.name.lower()))
+                for i, item in enumerate(entries):
+                    if count[0] >= 500:
+                        break
+                    count[0] += 1
+                    is_last = (i == len(entries) - 1)
+                    branch = "└── " if is_last else "├── "
+                    child_prefix = prefix + ("    " if is_last else "│   ")
+                    if item.is_dir():
+                        lines.append(f"{prefix}{branch}{item.name}/")
+                        if depth < 4:
+                            _walk(item, child_prefix, depth + 1, count)
+                    else:
+                        try:
+                            size = item.stat().st_size
+                        except OSError:
+                            size = 0
+                        lines.append(f"{prefix}{branch}{item.name} ({size} bytes)")
+
+            _walk(dir_path, "", 0, [0])
+            return "\n".join(lines)
         except Exception as e:
             return f"Error listing files: {e}"
 
     def _resolve_path(self, path: str) -> Path:
-        """Resolve file path relative to project root"""
+        """Resolve file path relative to project root (cwd)"""
         if path.startswith('/'):
             return Path(path)
         return (self.project_root / path).resolve()
@@ -709,14 +1122,141 @@ Rules:
             timestamp=datetime.now().isoformat()
         ))
 
+    def _run_shell(self, command: str, timeout: int = 30) -> str:
+        """Run a shell command, capturing output. Returns text for the LLM."""
+        if not command.strip():
+            return "Error: empty command"
+
+        # Safety: destructive or sudo commands need explicit y/N approval.
+        if not self._confirm_dangerous_command(command):
+            return ("[command blocked: user declined approval. "
+                    "Abort or rephrase without destructive/sudo operations.]")
+
+        timeout = max(1, min(int(timeout), 600))
+
+        try:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                executable="/bin/bash",
+                cwd=str(self.project_root),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception as e:
+            return f"Error starting command: {e}"
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            timed_out = False
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            timed_out = True
+
+        result = BashToolResult(
+            stdout=stdout or "",
+            stderr=stderr or "",
+            exit_code=proc.returncode if proc.returncode is not None else -1,
+            timed_out=timed_out,
+        )
+        return _truncate(result.format(), self.config.max_output_chars)
+
+    def _confirm_dangerous_command(self, command: str) -> bool:
+        """Return True if a command may run without (further) approval."""
+        dangerous = False
+        reasons = []
+        for pat in DESTRUCTIVE_PATTERNS:
+            if re.search(pat, command):
+                dangerous = True
+                reasons.append("destructive pattern")
+                break
+        if SUDO_PATTERN.search(command):
+            dangerous = True
+            reasons.append("uses sudo")
+
+        if not dangerous:
+            return True
+
+        # A previously-declined command stays blocked for this session, so the
+        # model cannot keep retrying the same destructive/sudo operation.
+        if command in self._declined_commands:
+            return False
+
+        try:
+            sys.stdout.write(
+                f"\n⚠️  This command is flagged as {', '.join(reasons)}:\n"
+                f"    {command}\n"
+                f"Run it? [y/N] ")
+            sys.stdout.flush()
+
+            # If stdin is not a TTY (piped/scripted), read a plain line; the
+            # whole program should only run destructively when the user is at
+            # a real terminal anyway.
+            if not sys.stdin.isatty():
+                try:
+                    answer = sys.stdin.readline().strip().lower()
+                except Exception:
+                    answer = ""
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                approved = answer in ("y", "yes")
+                if not approved:
+                    self._declined_commands.append(command)
+                return approved
+
+            # Temporarily restore cooked mode so the user can type freely.
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                answer = ""
+                while True:
+                    ch = sys.stdin.read(1)
+                    if ch in ("\r", "\n"):
+                        break
+                    if ch in ("y", "Y", "n", "N"):
+                        answer = ch
+                        break
+                    if ch == "\x03":
+                        raise KeyboardInterrupt
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            approved = answer.lower() == "y"
+            if not approved:
+                self._declined_commands.append(command)
+            return approved
+        except KeyboardInterrupt:
+            sys.stdout.write("\n[interrupted]\n")
+            return False
+
+    def _run_interactive(self, command: str) -> str:
+        """Run an interactive program using the user's own TTY."""
+        if not command.strip():
+            return "Error: empty command"
+        try:
+            sys.stdout.write(f"\n[Starting interactive: {command}]\n")
+            sys.stdout.flush()
+            # Run without pipes so the child gets the real terminal.
+            subprocess.call(command, shell=True,
+                            executable="/bin/bash",
+                            cwd=str(self.project_root))
+            return f"[interactive command finished: {command}]"
+        except Exception as e:
+            return f"Error running interactive command: {e}"
+
     def run(self):
         """Main interaction loop"""
-        print("Basic Coding Agent - Type 'quit' to exit")
+        print("Koder - server ops & coding agent")
         print(f"Project: {self.project_root}")
         print(f"Model: {self.config.model}")
+        print(f"API: {self.config.api_base}")
         if self.session_context:
             print(f"Session: {self.session_context.session_id} (auto-saved)")
-        print("Enhanced input enabled - Use arrow keys to edit, Ctrl+C to exit")
+        print("Type 'quit' to exit. Ctrl+C to interrupt.")
         print()
 
         while True:
@@ -740,68 +1280,75 @@ Rules:
                     timestamp=datetime.now().isoformat()
                 ))
 
-                # Call LLM
                 response = self._call_llm(self.messages)
+                choice = response.choices[0]
+                if not choice:
+                    print("Error: empty response from LLM")
+                    continue
 
-                # Parse response
-                if response.choices and len(response.choices) > 0:
-                    choice = response.choices[0]
-
-                    # Check for tool calls
+                # Tool execution loop: keep feeding results back to the model
+                # until it answers without another tool call.
+                tool_rounds = 0
+                while True:
                     tool_calls = self._parse_tool_calls(response)
+                    if not tool_calls:
+                        break
 
-                    if tool_calls:
-                        print(f"\n🔧 Executing {len(tool_calls)} tool(s)...")
-
-                        # Execute tools and add responses
-                        for tool_call in tool_calls:
-                            tool_name = tool_call.function['name']
-                            result = self._execute_tool(tool_call)
-
-                            # Show concise tool results
-                            if tool_name == "read_file":
-                                # For read_file, show summary instead of full content
-                                lines = result.split('\n')
-                                if len(lines) > 10 or len(result) > 500:
-                                    print(f"  📄 {tool_name}: {len(lines)} lines, {len(result)} bytes")
-                                else:
-                                    print(f"  📄 {tool_name}: {len(lines)} lines")
-                            elif tool_name == "write_file":
-                                print(f"  ✏️  {tool_name}: {result}")
-                            elif tool_name == "list_files":
-                                # Show summary for directory listings
-                                lines = result.split('\n')
-                                if len(lines) > 15:
-                                    print(f"  📁 {tool_name}: {len(lines)-1} items")
-                                else:
-                                    print(f"  📁 {tool_name}: {len(lines)-1} items")
-
-                            self._add_tool_response(tool_call, result)
-
-                        # Call LLM again with tool results
-                        print("\n🤖 Getting final response from LLM...")
+                    tool_rounds += 1
+                    if tool_rounds > 12:
+                        print("⚠️  Too many tool rounds - stopping to avoid a loop.")
+                        self.messages.append(Message(
+                            role="user",
+                            content="(system) Tool round limit reached (12). Stop calling tools and answer now.",
+                            timestamp=datetime.now().isoformat()
+                        ))
                         response = self._call_llm(self.messages)
-                        choice = response.choices[0]
+                        break
 
-                    # Get final response
-                    assistant_message = choice['message']['content']
+                    print(f"\n🔧 Executing {len(tool_calls)} tool(s)...")
+
+                    # Echo the assistant tool-call message so the model sees
+                    # what arguments it used (required before tool results).
+                    self.messages.append(Message(
+                        role="assistant",
+                        content="",
+                        tool_calls=[tc for tc in tool_calls],
+                        timestamp=datetime.now().isoformat()
+                    ))
+
+                    for tool_call in tool_calls:
+                        tool_name = tool_call.function['name']
+                        result = self._execute_tool(tool_call)
+                        self._print_tool_result(tool_name, result)
+                        self._add_tool_response(tool_call, result)
+
+                    print("🤖 Getting next response...")
+                    response = self._call_llm(self.messages)
+                    if not response.choices or not response.choices[0]:
+                        print("Error: empty response from LLM")
+                        break
+
+                # Get final response
+                choice = response.choices[0]
+                assistant_message = (choice.get('message') or {}).get('content') or ""
+                if assistant_message:
                     self.messages.append(Message(
                         role="assistant",
                         content=assistant_message,
                         timestamp=datetime.now().isoformat()
                     ))
-
                     print(f"\n🤖 {assistant_message}")
 
-                    # Update token usage
-                    usage = response.usage
-                    self.total_tokens_used += usage['prompt_tokens'] + usage['completion_tokens']
+                # Update token usage
+                usage = response.usage
+                self.total_tokens_used += usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)
+                print(f"\n💰 Tokens: {usage.get('prompt_tokens', 0)} + {usage.get('completion_tokens', 0)} = "
+                      f"{usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)} "
+                      f"(session: {self.total_tokens_used})")
 
-                    print(f"\n💰 Tokens: {usage['prompt_tokens']} + {usage['completion_tokens']} = {usage['prompt_tokens'] + usage['completion_tokens']} (session: {self.total_tokens_used})")
-
-                    # Auto-save session after every interaction
-                    if self.session_context:
-                        self._save_session()
+                # Auto-save session after every interaction
+                if self.session_context:
+                    self._save_session()
 
             except KeyboardInterrupt:
                 if self.session_context:
@@ -813,30 +1360,48 @@ Rules:
                 print(f"Error: {e}")
                 # Don't break on errors, continue the loop
 
+    def _print_tool_result(self, tool_name: str, result: str):
+        """Show a concise one-line summary of a tool result."""
+        n_lines = result.count('\n') + 1
+        preview = result.replace('\n', ' ')[:120]
+        if tool_name == "run_shell":
+            print(f"  💻 {tool_name}: {preview}")
+        elif tool_name == "run_interactive":
+            print(f"  🖥️  {tool_name}: {preview}")
+        elif tool_name == "write_file":
+            print(f"  ✏️  {tool_name}: {preview}")
+        elif tool_name == "edit_file":
+            print(f"  ✏️  {tool_name}: {preview}")
+        elif tool_name == "list_files":
+            print(f"  📁 {tool_name}: {n_lines} lines")
+        else:
+            print(f"  📄 {tool_name}: {n_lines} lines, {len(result)} bytes")
+
 
 def main():
     """Entry point"""
-    # Parse command line arguments
-    parser = argparse.ArgumentParser(description='Basic Coding Agent')
+    parser = argparse.ArgumentParser(
+        description='Koder - server ops & coding agent (OpenAI-compatible LLM)')
     parser.add_argument('--model', type=str,
-                       help='Specify which model to use (e.g., gpt-4, gpt-3.5-turbo)')
+                        help='Model name (default: KODER_MODEL or qwen3.8:27b)')
+    parser.add_argument('--api-base', dest='api_base_cli', type=str,
+                        help='OpenAI-compatible API base, e.g. http://localhost:11434/v1')
     parser.add_argument('--session', type=str,
-                       help='Specify session name to load (otherwise starts fresh session)')
+                        help='Session name to load (default: fresh session per directory)')
+    parser.add_argument('--cwd', type=str, default=None,
+                        help='Working directory for tools (default: current dir)')
 
     args = parser.parse_args()
 
-    # Check API key
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
-    if not api_key:
-        print("Error: OPENAI_API_KEY environment variable not set")
-        print("Get your API key from an OpenAI-compatible provider and set:")
-        print("export OPENAI_API_KEY='your-key-here'")
-        return
-
-    # Create config with optional model override
+    # Config: CLI flag > KODER_API_BASE env > local Ollama default. API key is
+    # optional because local endpoints (Ollama) usually need none.
     config = Config()
     if args.model:
         config.model = args.model
+    if args.api_base_cli:
+        config.api_base = args.api_base_cli
+    if args.cwd:
+        config.cwd = Path(args.cwd).expanduser()
 
     # Create and run agent
     agent = BasicCodingAgent(config, args.session)
