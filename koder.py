@@ -1,62 +1,26 @@
 #!/usr/bin/env python3
-"""
-Koder - Single-file server operations & coding agent using only stdlib.
+"""Koder: single-file server-ops & coding agent (stdlib only).
 
-Turns natural language into server-admin and coding actions on the host it
-runs on: inspect files/dirs, run shell commands, install/configure services,
-edit configs, and check service state. It uses any OpenAI-compatible chat
-completions endpoint (Ollama / llama.cpp / OpenRouter / OpenAI / etc.).
-
-Tools (used via OpenAI-style function calling):
-  read_file      - read a file (truncated if large)
-  write_file     - create/overwrite a file
-  edit_file      - apply a before/after string replacement to a file
-  list_files     - list a directory tree
-  run_shell      - run a shell command, capture stdout/stderr/exit code
-  run_interactive- run an interactive program (editor/pager/dialog)
-
-Safety:
-  - Destructive shell commands (rm -rf, mkfs, dd, ...) require y/N approval.
-  - Commands containing "sudo" require y/N approval.
-  - run_shell output is capped so a runaway command cannot flood the context.
+Runs an OpenAI-compatible chat endpoint (Ollama/llama.cpp/OpenRouter/...) as a
+natural-language shell: inspect/edit files, run shell commands, configure and
+maintain services. Tools: read_file, write_file, edit_file, list_files,
+run_shell, run_interactive. Destructive or sudo commands require y/N approval.
 
 Usage:
-    python koder.py [--model qwen3.8:27b] [--session NAME]
-                    [--api-base http://localhost:11434/v1] [--cwd DIR]
-
-    # Local models via Ollama (no API key needed)
-    python koder.py
-
-    # Remote OpenAI-compatible provider
-    OPENAI_API_KEY=sk-... python koder.py --api-base https://openrouter.ai/api/v1 \
-        --model openai/gpt-4o
-
-Environment:
-    KODER_MODEL, KODER_API_BASE   overrides for model / endpoint
-    OPENAI_API_KEY                used when the endpoint requires a key
+    python koder.py [--model qwen3.8:27b] [--api-base http://localhost:11434/v1]
+                    [--cwd DIR] [--session NAME]
+Env: KODER_MODEL / KODER_API_BASE / OPENAI_API_KEY (for remote endpoints)
 """
-
-import os
-import json
-import re
-import subprocess
-import urllib.request
-import urllib.error
-import argparse
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-import shutil
+import argparse, json, os, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request
 from dataclasses import dataclass
 from datetime import datetime
-import sys
-import termios
-import tty
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 
-# Configuration
+# Config ---------------------------------------------------------------
 @dataclass
 class Config:
-    # Default to a local Ollama endpoint; override with --api-base / KODER_API_BASE.
     api_base: str = os.getenv("KODER_API_BASE", "http://localhost:11434/v1")
     api_key: str = os.getenv("OPENAI_API_KEY", "")
     model: str = os.getenv("KODER_MODEL", "qwen3.8:27b")
@@ -64,33 +28,28 @@ class Config:
     temperature: float = 0.2
     request_timeout: int = 120
     max_context_files: int = 20
-    max_file_size: int = 100000          # 100KB cap for read_file
-    max_output_chars: int = 40000         # cap for run_shell stdout+stderr
+    max_file_size: int = 100_000        # read_file cap (100KB)
+    max_output_chars: int = 40_000      # run_shell output cap
     sessions_dir: Path = Path.home() / ".koder" / "sessions"
     cwd: Path = Path.cwd()
 
 
-# Regexes for commands that need explicit approval. Operate on the raw command
-# string (whole-word) so plain uses like `grep -r rm /etc` are not flagged.
+# Command patterns needing y/N approval (whole-word; harmless uses like
+# `grep rm` are not flagged). Declined commands are remembered for the session.
 DESTRUCTIVE_PATTERNS = [
-    r"\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+",   # rm -r / rm -f / rm -rf
-    r"\bmkfs(?:\.[a-z0-9]+)?\b",
-    r"\bdd\b",
-    r"\bmkswap\b|\bswapoff\b",
-    r"\bparted\b|\bfdisk\b|\bsfdisk\b",
-    r"\bkill\s+-9\b|\bpkill\s+-9\b",
-    r"\bgit\s+push\s+(-f|--force)\b",
-    r"\bmv\s+/\s+",
+    r"\brm\s+(-[a-zA-Z]*[rf][a-zA-Z]*\s+)+", r"\bmkfs(?:\.[a-z0-9]+)?\b",
+    r"\bdd\b", r"\bmkswap\b|\bswapoff\b", r"\bparted\b|\bfdisk\b|\bsfdisk\b",
+    r"\bkill\s+-9\b|\bpkill\s+-9\b", r"\bgit\s+push\s+(-f|--force)\b", r"\bmv\s+/\s+",
 ]
 SUDO_PATTERN = re.compile(r"(^|[;&|]\s*)sudo\s+")
 
 
-# Data structures
+# Data structures ------------------------------------------------------
 @dataclass
 class Message:
-    role: str  # "system", "user", "assistant", "tool"
+    role: str
     content: str
-    tool_calls: Optional[List[Dict]] = None
+    tool_calls: Optional[List["ToolCall"]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
     timestamp: Optional[str] = None
@@ -119,14 +78,13 @@ class SessionContext:
 
 @dataclass
 class BashToolResult:
-    """Result of a run_shell / run_interactive execution."""
+    """run_shell result: stdout/stderr with exit code."""
     stdout: str = ""
     stderr: str = ""
     exit_code: int = 0
     timed_out: bool = False
 
     def format(self) -> str:
-        """Format for the LLM: stdout then stderr, with exit code."""
         parts = []
         if self.stdout:
             parts.append(self.stdout.rstrip("\n"))
@@ -139,317 +97,114 @@ class BashToolResult:
 
 
 class EnhancedInput:
-    """Enhanced input function with line editing capabilities"""
+    """Raw-mode line editor with history (arrow keys, backspace, Ctrl+A/E/U)."""
 
     def __init__(self):
         self.history: List[str] = []
-        self.history_index = 0
-        self.current_line = ""
-        self.cursor_pos = 0
+        self.hist_i = 0
+        self.line = ""
+        self.pos = 0
+        self._saved = ""
 
-    def _getch(self) -> str:
-        """Get a single character from stdin"""
+    # --- line editing ---------------------------------------------------
+    def _redraw(self):
+        # Repaint prompt+line and park the cursor at `pos`.
+        sys.stdout.write("\r\x1b[K>> " + self.line + "\r>> " + self.line[:self.pos])
+        sys.stdout.flush()
+
+    def _key(self) -> str:
         fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+        old = termios.tcgetattr(fd)
         try:
-            tty.setraw(sys.stdin.fileno())
+            tty.setraw(fd)
             ch = sys.stdin.read(1)
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
         return ch
 
-    def _move_cursor(self, pos: int):
-        """Move cursor to specified position"""
-        sys.stdout.write(f"\r>> {self.current_line}")
-        sys.stdout.write(f"\r>> {self.current_line[:pos]}")
-        sys.stdout.flush()
-        self.cursor_pos = pos
+    def _insert(self, ch: str):
+        self.line = self.line[:self.pos] + ch + self.line[self.pos:]
+        self.pos += 1
+        self._redraw()
 
-    def _insert_char(self, char: str):
-        """Insert character at current cursor position"""
-        if self.cursor_pos == len(self.current_line):
-            self.current_line += char
-            sys.stdout.write(char)
-        else:
-            self.current_line = (self.current_line[:self.cursor_pos] + char +
-                               self.current_line[self.cursor_pos:])
-            sys.stdout.write(self.current_line[self.cursor_pos:])
-            sys.stdout.write(f"\r>> {self.current_line}")
-            sys.stdout.write(f"\r>> {self.current_line[:self.cursor_pos + 1]}")
-        sys.stdout.flush()
-        self.cursor_pos += 1
-
-    def _delete_char(self):
-        """Delete character at current cursor position"""
-        if self.cursor_pos == 0:
+    def _delete(self):
+        if self.pos == 0:
             return
-        if self.cursor_pos == len(self.current_line):
-            self.current_line = self.current_line[:-1]
-            sys.stdout.write("\b \b")
-        else:
-            self.current_line = (self.current_line[:self.cursor_pos - 1] +
-                               self.current_line[self.cursor_pos:])
-            sys.stdout.write("\b")
-            sys.stdout.write(self.current_line[self.cursor_pos - 1:] + " ")
-            sys.stdout.write(f"\r>> {self.current_line}")
-            sys.stdout.write(f"\r>> {self.current_line[:self.cursor_pos - 1]}")
-        sys.stdout.flush()
-        self.cursor_pos -= 1
+        self.line = self.line[:self.pos - 1] + self.line[self.pos:]
+        self.pos -= 1
+        self._redraw()
 
-    def _clear_line(self):
-        """Clear the current line"""
-        sys.stdout.write("\r>> " + " " * len(self.current_line) + "\r>> ")
-        sys.stdout.flush()
-        self.current_line = ""
-        self.cursor_pos = 0
-
-    def _show_history(self, direction: int):
-        """Show history item (1 for next, -1 for previous)"""
+    def _hist(self, direction: int):
         if not self.history:
             return
-
-        if direction == -1:  # Up arrow - previous history
-            if self.history_index == 0:
-                # Save current line when first going to history
-                self.temp_line = self.current_line
-            if self.history_index < len(self.history):
-                self.history_index += 1
-                self.current_line = self.history[-self.history_index]
-        elif direction == 1:  # Down arrow - next history
-            if self.history_index > 1:
-                self.history_index -= 1
-                self.current_line = self.history[-self.history_index]
-            elif self.history_index == 1:
-                self.history_index = 0
-                self.current_line = getattr(self, 'temp_line', '')
-
-        self._clear_line()
-        sys.stdout.write(self.current_line)
-        sys.stdout.flush()
-        self.cursor_pos = len(self.current_line)
+        if direction < 0:  # up: older
+            if self.hist_i == 0:
+                self._saved = self.line
+            if self.hist_i < len(self.history):
+                self.hist_i += 1
+                self.line = self.history[-self.hist_i]
+        else:              # down: newer
+            if self.hist_i > 0:
+                self.hist_i -= 1
+                self.line = self.history[-self.hist_i] if self.hist_i else self._saved
+        self.pos = len(self.line)
+        self._redraw()
 
     def readline(self, prompt: str = ">> ") -> str:
-        """Read a line with enhanced editing capabilities"""
-        # Fall back to plain input() when stdin is not a TTY (piped/scripted),
-        # since termios/tty raw mode needs an interactive terminal.
+        # Non-TTY (piped/scripted) fallback.
         if not sys.stdin.isatty():
             try:
-                line = input(prompt)
+                line = input(prompt).strip()
             except EOFError:
                 raise KeyboardInterrupt
-            line = line.strip()
             if line and (not self.history or self.history[-1] != line):
                 self.history.append(line)
-            self.history_index = 0
             return line
 
         sys.stdout.write(prompt)
         sys.stdout.flush()
-
-        self.current_line = ""
-        self.cursor_pos = 0
-
+        self.line, self.pos, self.hist_i = "", 0, 0
         while True:
             try:
-                char = self._getch()
-
-                # Handle special characters
-                if char == '\x03':  # Ctrl+C
-                    raise KeyboardInterrupt
-                elif char == '\r' or char == '\n':  # Enter
+                ch = self._key()
+                if ch in ("\r", "\n"):
                     sys.stdout.write("\n")
                     sys.stdout.flush()
-                    line = self.current_line.strip()
+                    line = self.line.strip()
                     if line and (not self.history or self.history[-1] != line):
                         self.history.append(line)
-                    self.history_index = 0
                     return line
-                elif char == '\x7f' or char == '\x08':  # Backspace/Delete
-                    self._delete_char()
-                elif char == '\x15':  # Ctrl+U - clear line
-                    self._clear_line()
-                elif char == '\x01':  # Ctrl+A - move to beginning
-                    self._move_cursor(0)
-                elif char == '\x05':  # Ctrl+E - move to end
-                    self._move_cursor(len(self.current_line))
-                elif char == '\x1b':  # Escape sequence (arrows, etc.)
-                    # Read the next two characters
-                    try:
-                        char2 = self._getch()
-                        char3 = self._getch()
-                        if char2 == '[':
-                            if char3 == 'A':  # Up arrow
-                                self._show_history(-1)
-                            elif char3 == 'B':  # Down arrow
-                                self._show_history(1)
-                            elif char3 == 'C':  # Right arrow
-                                if self.cursor_pos < len(self.current_line):
-                                    self._move_cursor(self.cursor_pos + 1)
-                            elif char3 == 'D':  # Left arrow
-                                if self.cursor_pos > 0:
-                                    self._move_cursor(self.cursor_pos - 1)
-                    except:
-                        pass  # Incomplete escape sequence
-                elif char >= ' ':  # Printable character
-                    self._insert_char(char)
-
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+                if ch in ("\x7f", "\x08"):        # backspace
+                    self._delete()
+                elif ch == "\x15":                 # Ctrl+U clear
+                    self.line, self.pos = "", 0
+                    self._redraw()
+                elif ch == "\x01":                 # Ctrl+A home
+                    self.pos = 0
+                    self._redraw()
+                elif ch == "\x05":                 # Ctrl+E end
+                    self.pos = len(self.line)
+                    self._redraw()
+                elif ch == "\x1b":                 # escape sequence
+                    seq = self._key() + self._key()
+                    if seq == "[A":
+                        self._hist(-1)
+                    elif seq == "[B":
+                        self._hist(1)
+                    elif seq == "[C" and self.pos < len(self.line):
+                        self.pos += 1
+                        self._redraw()
+                    elif seq == "[D" and self.pos > 0:
+                        self.pos -= 1
+                        self._redraw()
+                elif ch >= " ":
+                    self._insert(ch)
             except KeyboardInterrupt:
                 sys.stdout.write("^C\n")
                 sys.stdout.flush()
                 raise
-
-
-# ---------------------------------------------------------------------------
-# Tool schemas advertised to the model (OpenAI-style function calling)
-# ---------------------------------------------------------------------------
-
-def _get_tools() -> List[Dict]:
-    """Return the JSON schema for every tool the model can call."""
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": (
-                    "Read a file's content. Use this when the user asks about a "
-                    "file, config, log, or any file content."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to the file, absolute or relative to cwd",
-                        }
-                    },
-                    "required": ["path"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "write_file",
-                "description": (
-                    "Create a new file or overwrite an existing file with content."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to the file, absolute or relative to cwd",
-                        },
-                        "content": {
-                            "type": "string",
-                            "description": "Full new content of the file",
-                        },
-                    },
-                    "required": ["path", "content"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "edit_file",
-                "description": (
-                    "Edit an existing file by replacing a unique substring (before) "
-                    "with new text (after). A backup is made automatically."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Path to the file, absolute or relative to cwd",
-                        },
-                        "before": {
-                            "type": "string",
-                            "description": "Exact existing text to find (must be unique)",
-                        },
-                        "after": {
-                            "type": "string",
-                            "description": "Replacement text",
-                        },
-                    },
-                    "required": ["path", "before", "after"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "list_files",
-                "description": (
-                    "List files and directories under a path (non-recursive by "
-                    "default; pass recursive=true for a tree)."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "Directory to list, default '.'",
-                        },
-                        "recursive": {
-                            "type": "boolean",
-                            "description": "List recursively as a tree",
-                        },
-                    },
-                    "required": [],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "run_shell",
-                "description": (
-                    "Run a shell command (bash -c) on this machine and return its "
-                    "stdout/stderr and exit code. Use for server ops: service "
-                    "status, logs, package installs, process checks, systemctl, "
-                    "docker, disk usage, network, etc. Destructive or sudo "
-                    "commands require the user's y/N approval before running."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The shell command to run",
-                        },
-                        "timeout": {
-                            "type": "integer",
-                            "description": "Seconds to wait before killing (default 30)",
-                        },
-                    },
-                    "required": ["command"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "run_interactive",
-                "description": (
-                    "Run an interactive terminal program (editor, pager, dialog, "
-                    "top, etc.). Output is not captured; use for things that need "
-                    "a TTY and user interaction."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "Command to run interactively",
-                        },
-                    },
-                    "required": ["command"],
-                },
-            },
-        },
-    ]
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -457,10 +212,54 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     cut = text[:limit]
-    # Drop the possibly-partial last line for cleanliness.
     if "\n" in cut:
         cut = cut.rsplit("\n", 1)[0]
     return f"{cut}\n... [output truncated, {len(text) - len(cut)} more chars]"
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas (OpenAI-style function calling)
+# ---------------------------------------------------------------------------
+# (name, description, props, required) — props maps arg name -> (type, desc).
+_TOOL_SPECS = [
+    ("read_file", "Read a file's content. Use when the user asks about a file, config, log, or file content.",
+     {"path": ("string", "File path, absolute or relative to cwd")}, ["path"]),
+    ("write_file", "Create a new file or overwrite an existing one.",
+     {"path": ("string", "File path, absolute or relative to cwd"),
+      "content": ("string", "Full new content of the file")}, ["path", "content"]),
+    ("edit_file", "Edit an existing file by replacing a unique substring (before) with new text (after). A .bak backup is made.",
+     {"path": ("string", "File path, absolute or relative to cwd"),
+      "before": ("string", "Exact existing text to find (must be unique)"),
+      "after": ("string", "Replacement text")}, ["path", "before", "after"]),
+    ("list_files", "List files and directories under a path (recursive=true for a tree).",
+     {"path": ("string", "Directory to list, default '.'"),
+      "recursive": ("boolean", "List recursively as a tree")}, []),
+    ("run_shell", "Run a shell command (bash -c) on this machine, returning stdout/stderr and exit code. Use for server ops: service status, logs, package installs, process checks, systemctl, docker, disk/network, etc. Destructive or sudo commands require the user's y/N approval.",
+     {"command": ("string", "The shell command to run"),
+      "timeout": ("integer", "Seconds to wait before killing (default 30)")}, ["command"]),
+    ("run_interactive", "Run an interactive terminal program (editor, pager, dialog, top). Output is not captured; the user operates it directly.",
+     {"command": ("string", "Command to run interactively")}, ["command"]),
+]
+
+
+def _get_tools() -> List[Dict]:
+    """Return the OpenAI-style JSON schema for every tool."""
+    tools = []
+    for name, desc, props, required in _TOOL_SPECS:
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": {
+                    "type": "object",
+                    "properties": {p: {"type": t, "description": d}
+                                    for p, (t, d) in props.items()},
+                    "required": required,
+                },
+            },
+        })
+    return tools
 
 
 class BasicCodingAgent:

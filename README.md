@@ -1,350 +1,216 @@
-# Koder - Basic Coding Agent
+# Koder
 
-A lightweight, single-file coding agent implementation using only Python's standard library. Koder enables natural language interaction with your codebase through an OpenAI-compatible API.
+A single-file server operations & coding agent using **only Python's standard library**. Koder turns natural language into real actions on the host it runs on — inspect and edit files, run shell commands, install and configure services, check logs and process state — through any OpenAI-compatible chat API.
+
+```bash
+python koder.py          # talks to a local Ollama by default
+```
 
 ## Overview
 
-Koder is a command-line coding assistant that helps you work with code using natural language prompts. It provides intelligent file operations, project context awareness, and persistent session management - all in a single Python file with no external dependencies beyond standard library.
+Koder is a CLI agent for running a server or working in a codebase from the terminal. You describe what you want in plain language; it decides which tools to call, executes them, and iterates until the job is done. Everything — the LLM client, tool execution, safety prompts, session persistence, and the terminal UI — lives in one stdlib-only Python file.
+
+It's optimized for **local models** (Ollama / llama.cpp): lightweight context, no mandatory API key, and tool schemas sent only when the conversation may need them.
 
 ## Features
 
-### 🚀 **Core Capabilities**
-- **Natural Language Coding**: Interact with your codebase using plain English
-- **File Operations**: Read, write, and explore files with intelligent context
-- **Project Awareness**: Automatic project structure analysis and git integration
-- **Session Management**: Persistent conversation history across sessions
-- **Enhanced Input**: Full terminal editing with arrow keys, history, and shortcuts
+- **Server ops**: run shell commands, check `systemctl`/`docker`/processes, tail logs, install packages, manage services
+- **Coding**: read, write, and edit files with automatic `.bak` backups
+- **Safety prompts**: destructive commands (`rm -rf`, `mkfs`, `dd`, ...) and anything using `sudo` ask for y/N approval before running; declined commands stay blocked for the session
+- **Local-first**: defaults to `http://localhost:11434/v1` (Ollama) with no API key required
+- **Any OpenAI-compatible backend**: Ollama, llama.cpp, OpenRouter, OpenAI, vLLM, etc.
+- **Persistent sessions**: conversation history auto-saved per working directory
+- **Enhanced terminal**: arrow-key history, cursor movement, Ctrl+A/E/U shortcuts (falls back to plain `input()` when piped)
 
-### 🛠️ **Tool System**
-- `read_file(path)`: Read file contents with size limits
-- `write_file(path, content)`: Write files with automatic backups
-- `list_files(path)`: Explore directory structures
+## Tools
 
-### 💾 **Session Management**
-- **Persistent History**: Conversations are saved and restored automatically
-- **Context Summarization**: Intelligent conversation summaries for long sessions
-- **Auto-save**: Periodic automatic saves during long conversations
-- **Multiple Sessions**: Support for different project sessions
-
-### ⌨️ **Enhanced Terminal Interface**
-- **Line Editing**: Full cursor movement with arrow keys
-- **History Navigation**: Scroll through command history with up/down arrows
-- **Keyboard Shortcuts**:
-  - `Ctrl+A`: Move to beginning of line
-  - `Ctrl+E`: Move to end of line
-  - `Ctrl+U`: Clear current line
-  - `Ctrl+C`: Exit gracefully with session save
+| Tool | Purpose |
+|------|---------|
+| `read_file(path)` | Read a file's content (100KB cap) |
+| `write_file(path, content)` | Create/overwrite a file (backs up existing) |
+| `edit_file(path, before, after)` | Replace a unique substring in a file (backs up existing) |
+| `list_files(path, recursive?)` | List a directory, optionally as a recursive tree |
+| `run_shell(command, timeout?)` | Run a shell command; returns stdout/stderr + exit code (output capped) |
+| `run_interactive(command)` | Run an interactive program (editor, top, dialog) on your terminal |
 
 ## Installation
 
 ### Prerequisites
-- Python 3.7 or higher
-- An OpenAI-compatible API endpoint
-- API key from your provider
+
+- Python 3.7+
+- An OpenAI-compatible endpoint — a local one such as **Ollama** (`ollama serve`) or any remote provider
 
 ### Setup
 
-1. **Clone or download** the `koder.py` file to your project directory
+1. **Copy `koder.py`** anywhere you want to work (a project dir, a server, `~/.local/bin`).
 
-2. **Set up your API key** (choose one):
+2. **For local models (default)**: nothing to set. Just make sure Ollama is running and has a model pulled, e.g.
 
    ```bash
-   # For OpenAI
-   export OPENAI_API_KEY='your-openai-key-here'
-   
-   # For OpenRouter
-   export OPENROUTER_API_KEY='your-openrouter-key-here'
+   ollama pull qwen3.8:27b
    ```
 
-3. **Make it executable** (optional):
+3. **For a remote provider** that needs a key:
+
    ```bash
-   chmod +x koder.py
+   export OPENAI_API_KEY='your-key-here'
    ```
+
+4. Optional: `chmod +x koder.py`.
 
 ## Usage
 
-### Basic Usage
-
 ```bash
-# Start interactive mode
+# Local Ollama (defaults)
 python koder.py
 
-# Use a specific model
-python koder.py --model gpt-4
+# Pick a specific model / endpoint
+python koder.py --model qwen3.8:27b
+python koder.py --model gpt-4o --api-base https://openrouter.ai/api/v1
 
-# Start with a named session
-python koder.py --session my-project
+# Operate in a different directory (for running on a server elsewhere)
+python koder.py --cwd /srv/myapp
+
+# Resume a named session
+python koder.py --session prod-setup
 ```
 
-### Command Line Options
+### Command-line options
 
-```bash
-python koder.py [OPTIONS]
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | `KODER_MODEL` or `qwen3.8:27b` | Model name |
+| `--api-base` | `KODER_API_BASE` or `http://localhost:11434/v1` | OpenAI-compatible API base URL |
+| `--cwd` | current directory | Working directory for all tools |
+| `--session` | auto (directory name) | Session name to load/resume |
 
-Options:
-  --model MODEL        Specify which model to use (e.g., gpt-4, gpt-3.5-turbo)
-  --session NAME       Specify session name for context persistence
-  --load-session       Load existing session if available
+### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `KODER_MODEL` | Default model |
+| `KODER_API_BASE` | Default API base URL |
+| `OPENAI_API_KEY` | Used when the endpoint requires auth (non-local) |
+
+### Example interactions
+
 ```
-
-### Interactive Commands
-
-Once running, you can use these commands:
-- `quit`, `exit`, `q`: Exit the agent (saves session if active)
-- `Ctrl+C`: Keyboard interrupt (saves session if active)
-
-### Example Interactions
-
-```bash
->> Read the main.py file and explain what it does
-🤖 I'll read the main.py file and explain its functionality.
-
+>> what services are running?
 🔧 Executing 1 tool(s)...
-  📄 read_file: 45 lines
-
-🤖 The main.py file contains a web server implementation using Flask...
+  💻 run_shell: UNIT LOAD ACTIVE SUB DESCRIPTION ... [exit code: 0]
+🤖 nginx, docker, containerd and sshd are running. Want me to check
+   any of them or look at their logs?
 ```
 
-```bash
->> List all Python files in the project
-🤖 I'll list all Python files in your project directory.
-
+```
+>> add a swapfile of 2G and enable it
 🔧 Executing 1 tool(s)...
-  📁 list_files: 12 items
 
-🤖 Here are the Python files in your project:
-  - main.py (1523 bytes)
-  - utils.py (892 bytes)
-  - models.py (2341 bytes)
+⚠️  This command is flagged as destructive pattern:
+    dd if=/dev/zero of=/swapfile bs=1M count=2048
+Run it? [y/N] y
+  💻 run_shell: ... [exit code: 0]
+🤖 Created /swapfile, formatted it as swap, and added it to /etc/fstab.
 ```
 
-```bash
->> Create a new file called config.json with basic settings
-🤖 I'll create a new config.json file with basic settings.
-
+```
+>> what does the nginx config in /etc/nginx/sites-enabled do?
 🔧 Executing 1 tool(s)...
-  ✏️  write_file: Successfully wrote 127 bytes to config.json
-
-🤖 Created config.json with basic configuration settings including...
+  📄 read_file: 47 lines
+🤖 It's a reverse proxy that forwards example.com to a local Node app
+   on port 3000, with websocket support...
 ```
+
+If the user answers `N` to a safety prompt, the agent reports the block and offers a safer alternative instead of retrying.
 
 ## Configuration
 
-### Default Settings
-
-Koder uses sensible defaults but can be customized by modifying the `Config` class in `koder.py`:
+Defaults live in the `Config` dataclass at the top of `koder.py`:
 
 ```python
 @dataclass
 class Config:
-    api_base: str = "https://api.openai.com/v1"  # API endpoint
-    model: str = "gpt-4"                          # Default model
-    max_tokens: int = 2000                        # Response length limit
-    temperature: float = 0.2                      # Creativity setting
-    max_context_files: int = 20                   # Files shown in context
-    max_file_size: int = 100000                   # Max file size (100KB)
+    api_base: str = os.getenv("KODER_API_BASE", "http://localhost:11434/v1")
+    api_key: str = os.getenv("OPENAI_API_KEY", "")
+    model: str = os.getenv("KODER_MODEL", "qwen3.8:27b")
+    max_tokens: int = 2000          # response length cap
+    temperature: float = 0.2
+    request_timeout: int = 120      # LLM HTTP timeout (seconds)
+    max_context_files: int = 20     # entries shown in the startup context
+    max_file_size: int = 100_000    # read_file cap (bytes)
+    max_output_chars: int = 40_000  # run_shell output cap (chars)
+    sessions_dir: Path = Path.home() / ".koder" / "sessions"
+    cwd: Path = Path.cwd()
 ```
 
-### Supported API Providers
+### Safety rules
 
-Koder works with any OpenAI-compatible API:
+Commands are checked against `DESTRUCTIVE_PATTERNS` (whole-word, so harmless uses like `grep rm` are not flagged) and a sudo pattern. Matches prompt for y/N approval before running:
 
-#### OpenAI
-```python
-Config.api_base = "https://api.openai.com/v1"
-Config.model = "gpt-4"
-# Set OPENAI_API_KEY environment variable
-```
+- `rm -r` / `rm -f` / `rm -rf`
+- `mkfs*`, `dd`, `mkswap`/`swapoff`, `parted`/`fdisk`/`sfdisk`
+- `kill -9` / `pkill -9`
+- `git push -f` / `git push --force`
+- moving from `/`
+- any command invoking `sudo`
 
-#### OpenRouter
-```python
-Config.api_base = "https://openrouter.ai/api/v1"
-Config.model = "mistralai/mistral-7b-instruct"
-# Set OPENROUTER_API_KEY environment variable
-```
+A declined command is remembered for the session so the model cannot silently retry it.
 
-#### Local LLM Server
-```python
-Config.api_base = "http://localhost:8000/v1"
-Config.model = "llama2-7b"
-# No API key needed for local servers
-```
+## Sessions
 
-## Session Management
-
-### Session Files
-
-Sessions are automatically saved to:
-```
-~/.basic_coding_agent/sessions/
-├── my-project.json
-├── documentation.json
-└── bug-fixing.json
-```
-
-### Session Features
-
-- **Automatic Loading**: Sessions are loaded when you specify the name
-- **Incremental Saving**: Sessions are saved after every few interactions
-- **Context Preservation**: Last 10 messages are preserved for continuity
-- **Summary Generation**: Brief summaries help maintain conversation context
-
-### Using Sessions
-
-```bash
-# Start a new session
-python koder.py --session my-project
-
-# Later, resume the same session
-python koder.py --session my-project
-
-# The agent will load previous conversation context
-```
+Conversations auto-save after every turn to `~/.koder/sessions/<name>.json`, where `<name>` defaults to the working directory name (override with `--session`). The last 10 messages are restored on resume; the full history is trimmed to the most recent 40 messages during a session to protect the model's context window.
 
 ## Architecture
 
-### Core Components
+The file is organized as:
 
-1. **BasicCodingAgent**: Main orchestrator class
-   - Manages conversation flow
-   - Handles tool execution
-   - Maintains session state
+1. **`Config` + safety patterns** — endpoint/model defaults and the approval regexes
+2. **Dataclasses** — `Message`, `ToolCall`, `LLMResponse`, `SessionContext`, `BashToolResult`
+3. **`EnhancedInput`** — raw-mode line editor (history, cursor keys, Ctrl+A/E/U), plain `input()` fallback when stdin isn't a TTY
+4. **`_TOOL_SPECS` / `_get_tools()`** — the tool schemas advertised to the model; add a tool by appending one tuple
+5. **`BasicCodingAgent`** — orchestration: session load/save, system prompt, LLM calls (JSON or streaming NDJSON), message trimming, the tool-execution loop (with a 12-round guard), and the file/shell tool implementations
 
-2. **EnhancedInput**: Terminal input handler
-   - Provides line editing capabilities
-   - Maintains command history
-   - Handles special keys and shortcuts
-
-3. **Message System**: Conversation management
-   - Stores message history
-   - Handles tool calls and responses
-   - Manages timestamps and metadata
-
-4. **Tool System**: File operations
-   - Read/write file operations
-   - Directory exploration
-   - Automatic backup creation
-
-### Data Flow
+### Data flow
 
 ```
-User Input → Message History → LLM API → Tool Execution → Response → User
-     ↓                                                            ↓
-Session Save ←──────────────────────────────────────────── Token Tracking
+User input → message history → LLM (chat/completions) → tool calls?
+                                                        ↓ yes
+                ◄── assistant tool_call echo + tool results
+                                                        ↓ no
+                          final answer → printed + session saved
 ```
 
-## Advanced Usage
+### Design notes
 
-### Working with Large Projects
-
-Koder intelligently manages project context:
-
-- **Automatic Truncation**: Large directory listings are summarized
-- **Size Limits**: Files over 100KB are not read (configurable)
-- **Context Limits**: Only most relevant files shown in project overview
-
-### File Safety
-
-- **Automatic Backups**: Original files are backed up before writing (`.bak` extension)
-- **Error Recovery**: Failed writes automatically restore from backup
-- **Size Checks**: Large files are rejected to prevent memory issues
-
-### Token Management
-
-- **Usage Tracking**: Token counts tracked per request and session
-- **Budget Awareness**: Running totals help monitor API costs
-- **Efficient Context**: Only essential context included in requests
+- **Stdlib only** — HTTP via `urllib`, processes via `subprocess`, no dependencies.
+- **Local-model friendly** — tool schemas are only attached when the tail of the conversation may need them; long tool output is truncated; history is capped.
+- **Streaming-tolerant** — parses both plain JSON and NDJSON streaming responses, so it works with servers that stream by default.
 
 ## Troubleshooting
 
-### Common Issues
+**Connection refused to `http://localhost:11434/v1`**
+Make sure Ollama is running (`ollama serve`) and reachable.
 
-**"OPENAI_API_KEY environment variable not set"**
-```bash
-export OPENAI_API_KEY='your-key-here'
-# or
-export OPENROUTER_API_KEY='your-key-here'
-```
-
-**"API Error 401: Invalid API key"**
-- Verify your API key is correct
-- Check if the key has sufficient credits
-- Ensure you're using the correct environment variable name
+**"API key required for non-local endpoint"**
+Set `OPENAI_API_KEY` (or pass an `--api-base` pointing at a local server).
 
 **"File too large"**
-- The default limit is 100KB per file
-- Modify `max_file_size` in the Config class to adjust
+Adjust `max_file_size` in `Config`, or use `run_shell` (e.g. `tail`, `head`) for big files.
 
-**"Request failed: Connection timeout"**
-- Check your internet connection
-- Verify the API endpoint URL is correct
-- Some networks may block certain API endpoints
+**Model isn't calling tools reliably**
+Prefer a model with solid function calling (e.g. `qwen3.8:27b`, `devstral`). Check `ollama list`; some small models handle tool use poorly.
 
-### Performance Tips
-
-1. **Use specific session names** for different projects
-2. **Keep conversations focused** to maintain context efficiency
-3. **Use clear, specific prompts** for better results
-4. **Monitor token usage** to manage API costs
-
-## Comparison with Mistral Vibe
-
-This implementation (`koder.py`) is a lightweight, single-file alternative to the full Mistral Vibe agent implementation. Key differences:
-
-| Feature | Koder (Basic) | Mistral Vibe (Full) |
-|---------|---------------|---------------------|
-| **Dependencies** | Standard library only | Multiple external packages |
-| **File Count** | Single file | Full package structure |
-| **Setup** | Copy and run | pip install + configuration |
-| **Features** | Core functionality | Advanced tools, UI, plugins |
-| **Flexibility** | Modify source | Configuration files |
-| **Use Case** | Quick setup, learning | Production, team use |
+**Session not resuming from another directory**
+Sessions are tied to the working directory. Pass `--session NAME` to force-load a specific one.
 
 ## Development
 
-### Extending Koder
+The project deliberately stays a single stdlib-only file. To extend it:
 
-To add new features, you can modify these key areas:
-
-1. **Add New Tools**: Implement new functions in the tool system
-2. **Customize Prompts**: Modify the system prompt generation
-3. **Add Providers**: Extend API backend support
-4. **Enhance UI**: Improve the terminal interface
-
-### Code Structure
-
-```python
-# Main components to modify:
-class BasicCodingAgent:      # Core logic
-class EnhancedInput:          # Terminal interface  
-class Config:                 # Configuration
-class Message:                # Data structure
-```
-
-## Contributing
-
-This is a basic implementation meant for learning and quick setup. To contribute:
-
-1. **Keep it simple**: Maintain single-file design
-2. **Standard library only**: No external dependencies
-3. **Clear documentation**: Comment complex sections
-4. **Backward compatibility**: Don't break existing functionality
+1. **Add a tool**: append a `(name, description, props, required)` tuple to `_TOOL_SPECS`, add an `elif` branch in `_execute_tool`, and implement the handler method.
+2. **Tune safety**: edit `DESTRUCTIVE_PATTERNS` / `SUDO_PATTERN`.
+3. **Change behavior**: adjust the system prompt in `_initialize_system_prompt` or the `Config` defaults.
 
 ## License
 
-This implementation is provided as-is for educational and personal use. Please respect the API provider's terms of service and pricing policies.
-
-## Support
-
-For issues specific to this implementation:
-- Check the troubleshooting section above
-- Review the inline code comments
-- Examine session files in `~/.basic_coding_agent/sessions/`
-
-For API-related issues:
-- OpenAI: https://platform.openai.com/docs/api-reference
-- OpenRouter: https://openrouter.ai/docs
-
----
-
-**Note**: This is a basic implementation demonstrating core concepts. For production use with advanced features, consider the full Mistral Vibe implementation documented in `MISTRAL_VIBE_AGENT_IMPLEMENTATION.md`.
+Provided as-is for personal and educational use. Respect your API provider's terms of service.
