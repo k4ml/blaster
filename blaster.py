@@ -10,7 +10,7 @@ Destructive or sudo commands require y/N approval.
 
 Usage:
     python blaster.py [--model qwen3.8:27b] [--api-base http://localhost:11434/v1]
-                      [--cwd DIR] [--session NAME] [-n MAX_ITERATION]
+                      [--cwd DIR] [--session NAME] [-s] [-n MAX_ITERATION]
 Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (optional; only sent when set)
 """
 import argparse, json, os, random, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request, uuid
@@ -38,6 +38,8 @@ class Config:
     # Render non-interactive markdown answers with glow when available and
     # stdout is a TTY; -x/--no-format disables.
     format_markdown: bool = True
+    # Persist sessions to disk; -s/--no-session disables (no load/create/save).
+    session_enabled: bool = True
 
 
 # Command patterns needing y/N approval (whole-word; harmless uses like
@@ -324,16 +326,20 @@ class BasicCodingAgent:
         self.total_tokens_used = 0
         self.input_handler = EnhancedInput()
 
-        # Setup sessions directory
-        self.config.sessions_dir.mkdir(parents=True, exist_ok=True)
-
         # Sessions are identified by a unique id and a human-friendly name
         # describing the task. Load a session by name if one was given,
         # otherwise start a fresh session with an auto-generated name.
-        if session_name:
-            self._load_or_create_session(session_name)
+        # -s/--no-session disables all of this (no load, create, or save).
+        if not self.config.session_enabled:
+            self.session_context = None
+            print("🚫 " + _c("Sessions disabled (-s/--no-session); conversation will not be saved.", "yellow"))
         else:
-            self._create_new_session(self._generate_session_name())
+            # Setup sessions directory
+            self.config.sessions_dir.mkdir(parents=True, exist_ok=True)
+            if session_name:
+                self._load_or_create_session(session_name)
+            else:
+                self._create_new_session(self._generate_session_name())
 
         # Initialize with system prompt
         self._initialize_system_prompt()
@@ -1349,6 +1355,9 @@ def main():
     parser.add_argument('-x', '--no-format', dest='format_markdown',
                         action='store_false',
                         help='Disable glow markdown formatting in non-interactive mode')
+    parser.add_argument('-s', '--no-session', dest='session_enabled',
+                        action='store_false',
+                        help='Disable sessions: do not load, create, or save any session')
     args = parser.parse_args()
 
     if args.session == '__list__':
@@ -1367,6 +1376,7 @@ def main():
     if args.max_iterations is not None:
         config.max_iterations = args.max_iterations
     config.format_markdown = args.format_markdown
+    config.session_enabled = args.session_enabled
 
     # Create and run agent
     agent = BasicCodingAgent(config, args.session)
