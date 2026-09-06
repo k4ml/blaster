@@ -1,14 +1,14 @@
-# Koder
+# Blaster
 
-A single-file server operations & coding agent using **only Python's standard library**. Koder turns natural language into real actions on the host it runs on — inspect and edit files, run shell commands, install and configure services, check logs and process state — through any OpenAI-compatible chat API.
+A single-file server operations & coding agent using **only Python's standard library**, named after the Transformers Autobot Blaster. Blaster turns natural language into real actions on the host it runs on — inspect and edit files, run shell commands, install and configure services, check logs and process state — through any OpenAI-compatible chat API.
 
 ```bash
-python koder.py          # talks to a local Ollama by default
+python blaster.py          # talks to a local Ollama by default
 ```
 
 ## Overview
 
-Koder is a CLI agent for running a server or working in a codebase from the terminal. You describe what you want in plain language; it decides which tools to call, executes them, and iterates until the job is done. Everything — the LLM client, tool execution, safety prompts, session persistence, and the terminal UI — lives in one stdlib-only Python file.
+Blaster is a CLI agent for running a server or working in a codebase from the terminal. You describe what you want in plain language; it decides which tools to call, executes them, and iterates until the job is done. Everything — the LLM client, tool execution, safety prompts, session persistence, and the terminal UI — lives in one stdlib-only Python file.
 
 It's optimized for **local models** (Ollama / llama.cpp): lightweight context, no mandatory API key, and tool schemas sent only when the conversation may need them.
 
@@ -42,7 +42,7 @@ It's optimized for **local models** (Ollama / llama.cpp): lightweight context, n
 
 ### Setup
 
-1. **Copy `koder.py`** anywhere you want to work (a project dir, a server, `~/.local/bin`).
+1. **Copy `blaster.py`** anywhere you want to work (a project dir, a server, `~/.local/bin`).
 
 2. **For local models (default)**: nothing to set. Just make sure Ollama is running and has a model pulled, e.g.
 
@@ -56,40 +56,41 @@ It's optimized for **local models** (Ollama / llama.cpp): lightweight context, n
    export OPENAI_API_KEY='your-key-here'
    ```
 
-4. Optional: `chmod +x koder.py`.
+4. Optional: `chmod +x blaster.py`.
 
 ## Usage
 
 ```bash
 # Local Ollama (defaults)
-python koder.py
+python blaster.py
 
 # Pick a specific model / endpoint
-python koder.py --model qwen3.8:27b
-python koder.py --model gpt-4o --api-base https://openrouter.ai/api/v1
+python blaster.py --model qwen3.8:27b
+python blaster.py --model gpt-4o --api-base https://openrouter.ai/api/v1
 
 # Operate in a different directory (for running on a server elsewhere)
-python koder.py --cwd /srv/myapp
+python blaster.py --cwd /srv/myapp
 
-# Resume a named session
-python koder.py --session prod-setup
+# Resume a named session (bare --session lists saved sessions)
+python blaster.py --session prod-setup
+python blaster.py --session
 ```
 
 ### Command-line options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model` | `KODER_MODEL` or `qwen3.8:27b` | Model name |
-| `--api-base` | `KODER_API_BASE` or `http://localhost:11434/v1` | OpenAI-compatible API base URL |
+| `--model` | `BLASTER_MODEL` or `qwen3.8:27b` | Model name |
+| `--api-base` | `BLASTER_API_BASE` or `http://localhost:11434/v1` | OpenAI-compatible API base URL |
 | `--cwd` | current directory | Working directory for all tools |
-| `--session` | auto (directory name) | Session name to load/resume |
+| `--session` | auto (directory name) | Session name to load/resume; bare `--session` lists sessions |
 
 ### Environment variables
 
 | Variable | Purpose |
 |----------|---------|
-| `KODER_MODEL` | Default model |
-| `KODER_API_BASE` | Default API base URL |
+| `BLASTER_MODEL` | Default model |
+| `BLASTER_API_BASE` | Default API base URL |
 | `OPENAI_API_KEY` | Used when the endpoint requires auth (non-local) |
 
 ### Example interactions
@@ -125,21 +126,21 @@ If the user answers `N` to a safety prompt, the agent reports the block and offe
 
 ## Configuration
 
-Defaults live in the `Config` dataclass at the top of `koder.py`:
+Defaults live in the `Config` dataclass at the top of `blaster.py`:
 
 ```python
 @dataclass
 class Config:
-    api_base: str = os.getenv("KODER_API_BASE", "http://localhost:11434/v1")
+    api_base: str = os.getenv("BLASTER_API_BASE", "http://localhost:11434/v1")
     api_key: str = os.getenv("OPENAI_API_KEY", "")
-    model: str = os.getenv("KODER_MODEL", "qwen3.8:27b")
+    model: str = os.getenv("BLASTER_MODEL", "qwen3.8:27b")
     max_tokens: int = 2000          # response length cap
     temperature: float = 0.2
     request_timeout: int = 120      # LLM HTTP timeout (seconds)
     max_context_files: int = 20     # entries shown in the startup context
     max_file_size: int = 100_000    # read_file cap (bytes)
     max_output_chars: int = 40_000  # run_shell output cap (chars)
-    sessions_dir: Path = Path.home() / ".koder" / "sessions"
+    sessions_dir: Path = Path.home() / ".blaster" / "sessions"
     cwd: Path = Path.cwd()
 ```
 
@@ -158,7 +159,7 @@ A declined command is remembered for the session so the model cannot silently re
 
 ## Sessions
 
-Conversations auto-save after every turn to `~/.koder/sessions/<name>.json`, where `<name>` defaults to the working directory name (override with `--session`). The last 10 messages are restored on resume; the full history is trimmed to the most recent 40 messages during a session to protect the model's context window.
+Conversations auto-save after every turn to `~/.blaster/sessions/<name>.json`, where `<name>` defaults to the working directory name (override with `--session`; bare `python blaster.py --session` lists saved sessions). On resume the last 100 messages are restored and shown as a recap, and the per-turn context window is capped at 100 messages to protect the model's context.
 
 ## Architecture
 

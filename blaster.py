@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Koder: single-file server-ops & coding agent (stdlib only).
+"""Blaster: single-file server-ops & coding agent (stdlib only).
 
-Runs an OpenAI-compatible chat endpoint (Ollama/llama.cpp/OpenRouter/...) as a
-natural-language shell: inspect/edit files, run shell commands, configure and
-maintain services. Tools: read_file, write_file, edit_file, list_files,
-run_shell, run_interactive. Destructive or sudo commands require y/N approval.
+Named after the Transformers Autobot Blaster — the agent that gets things
+done on the host it runs on. Uses an OpenAI-compatible chat endpoint
+(Ollama/llama.cpp/OpenRouter/...) as a natural-language shell: inspect/edit
+files, run shell commands, configure and maintain services. Tools:
+read_file, write_file, edit_file, list_files, run_shell, run_interactive.
+Destructive or sudo commands require y/N approval.
 
 Usage:
-    python koder.py [--model qwen3.8:27b] [--api-base http://localhost:11434/v1]
-                    [--cwd DIR] [--session NAME]
-Env: KODER_MODEL / KODER_API_BASE / OPENAI_API_KEY (for remote endpoints)
+    python blaster.py [--model qwen3.8:27b] [--api-base http://localhost:11434/v1]
+                      [--cwd DIR] [--session NAME]
+Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (for remote endpoints)
 """
 import argparse, json, os, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request
 from dataclasses import dataclass
@@ -21,16 +23,16 @@ from typing import Any, Dict, List, Optional
 # Config ---------------------------------------------------------------
 @dataclass
 class Config:
-    api_base: str = os.getenv("KODER_API_BASE", "http://localhost:11434/v1")
+    api_base: str = os.getenv("BLASTER_API_BASE", "http://localhost:11434/v1")
     api_key: str = os.getenv("OPENAI_API_KEY", "")
-    model: str = os.getenv("KODER_MODEL", "qwen3.8:27b")
+    model: str = os.getenv("BLASTER_MODEL", "qwen3.8:27b")
     max_tokens: int = 2000
     temperature: float = 0.2
     request_timeout: int = 120
     max_context_files: int = 20
     max_file_size: int = 100_000        # read_file cap (100KB)
     max_output_chars: int = 40_000      # run_shell output cap
-    sessions_dir: Path = Path.home() / ".koder" / "sessions"
+    sessions_dir: Path = Path.home() / ".blaster" / "sessions"
     cwd: Path = Path.cwd()
 
 
@@ -469,7 +471,7 @@ class BasicCodingAgent:
         project_info = self._get_project_info()
         session_info = self._get_session_info()
 
-        system_prompt = f"""You are Koder, a server operations and coding assistant running directly on this machine. You help set up, maintain, configure, and debug servers and code, and you execute actions via tools.
+        system_prompt = f"""You are Blaster, a server operations and coding assistant running directly on this machine. You help set up, maintain, configure, and debug servers and code, and you execute actions via tools.
 
 You operate in the working directory: {self.project_root}
 The current date is {datetime.now().strftime('%Y-%m-%d')}.
@@ -1088,7 +1090,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         n = len(past) - 1  # exclude the (empty) initial context
         print(_c(f"\n— previous conversation ({n} messages) —", "dim"))
         for m in past:
-            who = _c("you", "cyan") if m.role == "user" else _c("koder", "green")
+            who = _c("you", "cyan") if m.role == "user" else _c("blaster", "green")
             text = m.content.strip().replace("\n", " ")
             if len(text) > 300:
                 text = text[:300] + "…"
@@ -1097,7 +1099,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
 
     def run(self):
         """Main interaction loop"""
-        print(_c("Koder — server ops & coding agent", "bold"))
+        print(_c("Blaster — server ops & coding agent", "bold"))
         print(f"  {_c('Project:', 'cyan')} {self.project_root}")
         print(f"  {_c('Model:', 'cyan')}   {self.config.model}")
         print(f"  {_c('API:', 'cyan')}     {self.config.api_base}")
@@ -1256,15 +1258,15 @@ def _show_sessions(sessions_dir: Path) -> None:
             name, msgs, created, last, proj = f.stem, "?", "?", "?", "?"
         print(f"{name:<22} {str(msgs):>5}  {created:<10}  {last:<10}  {proj}")
     print()
-    print(_c("Resume one with: python koder.py --session NAME", "dim"))
+    print(_c("Resume one with: python blaster.py --session NAME", "dim"))
 
 
 def main():
     """Entry point"""
     parser = argparse.ArgumentParser(
-        description='Koder - server ops & coding agent (OpenAI-compatible LLM)')
+        description='Blaster - server ops & coding agent (OpenAI-compatible LLM)')
     parser.add_argument('--model', type=str,
-                        help='Model name (default: KODER_MODEL or qwen3.8:27b)')
+                        help='Model name (default: BLASTER_MODEL or qwen3.8:27b)')
     parser.add_argument('--api-base', dest='api_base_cli', type=str,
                         help='OpenAI-compatible API base, e.g. http://localhost:11434/v1')
     parser.add_argument('--session', type=str, nargs='?', const='__list__', default=None,
@@ -1278,7 +1280,7 @@ def main():
         _show_sessions(Config().sessions_dir)
         return
 
-    # Config: CLI flag > KODER_API_BASE env > local Ollama default. API key is
+    # Config: CLI flag > BLASTER_API_BASE env > local Ollama default. API key is
     # optional because local endpoints (Ollama) usually need none.
     config = Config()
     if args.model:
