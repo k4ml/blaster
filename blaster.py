@@ -11,7 +11,7 @@ Destructive or sudo commands require y/N approval.
 Usage:
     python blaster.py [--model qwen3.8:27b] [--api-base http://localhost:11434/v1]
                       [--cwd DIR] [--session NAME] [-n MAX_ITERATION]
-Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (for remote endpoints)
+Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (optional; only sent when set)
 """
 import argparse, json, os, random, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request, uuid
 from dataclasses import dataclass
@@ -597,12 +597,9 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         response; if the server returns NDJSON streaming deltas it reads them
         and reassembles a normal-looking response object.
         """
-        if not self.config.api_key:
-            # Local endpoints (Ollama) accept an empty key; remote providers
-            # require one. Only raise if the endpoint does not look local.
-            if "localhost" not in self.config.api_base and "127.0.0.1" not in self.config.api_base:
-                raise ValueError(
-                    "API key required for non-local endpoint. Set OPENAI_API_KEY.")
+        # API key is optional for every endpoint: local servers (Ollama,
+        # llama.cpp) and many remote gateways accept requests without one.
+        # The Authorization header is only sent when a key is configured.
 
         # Trim the oldest messages so a long session cannot overflow the
         # model's context window.
