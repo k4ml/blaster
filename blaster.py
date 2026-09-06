@@ -1189,6 +1189,14 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
 
             for tool_call in tool_calls:
                 tool_name = tool_call.function['name']
+                # Show the exact command before running it so the user can
+                # follow along (and see what they're approving).
+                if tool_name == "run_shell":
+                    try:
+                        cmd = json.loads(tool_call.function.get('arguments', '{}')).get('command', '')
+                    except json.JSONDecodeError:
+                        cmd = tool_call.function.get('arguments', '')
+                    print(f"  💻 run_shell: {_c('$ ', 'cyan')}{_c(cmd, 'cyan')}")
                 result = self._execute_tool(tool_call)
                 self._print_tool_result(tool_name, result)
                 self._add_tool_response(tool_call, result)
