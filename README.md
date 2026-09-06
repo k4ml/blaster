@@ -83,6 +83,7 @@ python blaster.py --session
 | `--model` | `BLASTER_MODEL` or `qwen3.8:27b` | Model name |
 | `--api-base` | `BLASTER_API_BASE` or `http://localhost:11434/v1` | OpenAI-compatible API base URL |
 | `--cwd` | current directory | Working directory for all tools |
+| `-n`/`--max-iteration` | 50 | Max tool rounds per turn (safety limit to prevent loops) |
 | `--session` | auto (directory name) | Session name to load/resume; bare `--session` lists sessions |
 
 ### Environment variables
@@ -140,6 +141,7 @@ class Config:
     max_context_files: int = 20     # entries shown in the startup context
     max_file_size: int = 100_000    # read_file cap (bytes)
     max_output_chars: int = 40_000  # run_shell output cap (chars)
+    max_iterations: int = 50        # tool round limit per turn
     sessions_dir: Path = Path.home() / ".blaster" / "sessions"
     cwd: Path = Path.cwd()
 ```
@@ -169,7 +171,7 @@ The file is organized as:
 2. **Dataclasses** — `Message`, `ToolCall`, `LLMResponse`, `SessionContext`, `BashToolResult`
 3. **`EnhancedInput`** — raw-mode line editor (history, cursor keys, Ctrl+A/E/U), plain `input()` fallback when stdin isn't a TTY
 4. **`_TOOL_SPECS` / `_get_tools()`** — the tool schemas advertised to the model; add a tool by appending one tuple
-5. **`BasicCodingAgent`** — orchestration: session load/save, system prompt, LLM calls (JSON or streaming NDJSON), message trimming, the tool-execution loop (with a 12-round guard), and the file/shell tool implementations
+5. **`BasicCodingAgent`** — orchestration: session load/save, system prompt, LLM calls (JSON or streaming NDJSON), message trimming, the tool-execution loop (with a configurable round guard, default 50), and the file/shell tool implementations
 
 ### Data flow
 

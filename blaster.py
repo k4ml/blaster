@@ -10,7 +10,7 @@ Destructive or sudo commands require y/N approval.
 
 Usage:
     python blaster.py [--model qwen3.8:27b] [--api-base http://localhost:11434/v1]
-                      [--cwd DIR] [--session NAME]
+                      [--cwd DIR] [--session NAME] [-n MAX_ITERATION]
 Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (for remote endpoints)
 """
 import argparse, json, os, random, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request, uuid
@@ -32,6 +32,7 @@ class Config:
     max_context_files: int = 20
     max_file_size: int = 100_000        # read_file cap (100KB)
     max_output_chars: int = 40_000      # run_shell output cap
+    max_iterations: int = 50            # tool round limit per turn
     sessions_dir: Path = Path.home() / ".blaster" / "sessions"
     cwd: Path = Path.cwd()
     # Render non-interactive markdown answers with glow when available and
@@ -1162,11 +1163,11 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                 break
 
             tool_rounds += 1
-            if tool_rounds > 12:
-                print(_c("⚠️  Too many tool rounds - stopping to avoid a loop.", "red"))
+            if tool_rounds > self.config.max_iterations:
+                print(_c(f"⚠️  Tool round limit reached ({self.config.max_iterations}) - stopping to avoid a loop.", "red"))
                 self.messages.append(Message(
                     role="user",
-                    content="(system) Tool round limit reached (12). Stop calling tools and answer now.",
+                    content=f"(system) Tool round limit reached ({self.config.max_iterations}). Stop calling tools and answer now.",
                     timestamp=datetime.now().isoformat()
                 ))
                 response = self._call_llm(self.messages)
@@ -1346,6 +1347,8 @@ def main():
                         help='Working directory for tools (default: current dir)')
     parser.add_argument('-p', '--prompt', type=str, default=None,
                         help='Non-interactive mode: run a single prompt and exit')
+    parser.add_argument('-n', '--max-iteration', dest='max_iterations', type=int,
+                        help='Max tool rounds per turn (default: 50)')
     parser.add_argument('-x', '--no-format', dest='format_markdown',
                         action='store_false',
                         help='Disable glow markdown formatting in non-interactive mode')
@@ -1364,6 +1367,8 @@ def main():
         config.api_base = args.api_base_cli
     if args.cwd:
         config.cwd = Path(args.cwd).expanduser()
+    if args.max_iterations is not None:
+        config.max_iterations = args.max_iterations
     config.format_markdown = args.format_markdown
 
     # Create and run agent
