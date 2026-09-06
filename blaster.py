@@ -34,6 +34,9 @@ class Config:
     max_output_chars: int = 40_000      # run_shell output cap
     sessions_dir: Path = Path.home() / ".blaster" / "sessions"
     cwd: Path = Path.cwd()
+    # Render non-interactive markdown answers with glow when available and
+    # stdout is a TTY; -x/--no-format disables.
+    format_markdown: bool = True
 
 
 # Command patterns needing y/N approval (whole-word; harmless uses like
@@ -237,6 +240,26 @@ def _c(text: str, style: str = "") -> str:
     if not _USE_COLOR or not code:
         return text
     return f"{code}{text}\x1b[0m"
+
+
+_GLOW_PATH = shutil.which("glow")  # None when glow is not installed.
+
+
+def _render_markdown(text: str) -> None:
+    """Render markdown via glow when it exists and stdout is a TTY.
+
+    Glow reads the markdown on stdin and writes styled output straight to the
+    terminal (its own stdout must be a TTY to emit ANSI). Falls back to
+    printing the plain text when glow is missing or output is piped.
+    """
+    if not _USE_COLOR or not _GLOW_PATH or not text.strip():
+        print(text)
+        return
+    try:
+        proc = subprocess.Popen([_GLOW_PATH], stdin=subprocess.PIPE)
+        proc.communicate(text.encode(), timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        print(text)
 
 
 # ---------------------------------------------------------------------------
@@ -1198,7 +1221,10 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         finally:
             if self.session_context:
                 self._save_session()
-        print(f"\n🤖 {_c(answer, 'green')}")
+        if self.config.format_markdown and _USE_COLOR:
+            _render_markdown(f"\n{answer}")
+        else:
+            print(f"\n🤖 {_c(answer, 'green')}")
         return answer
 
     def run(self):
@@ -1320,7 +1346,9 @@ def main():
                         help='Working directory for tools (default: current dir)')
     parser.add_argument('-p', '--prompt', type=str, default=None,
                         help='Non-interactive mode: run a single prompt and exit')
-
+    parser.add_argument('-x', '--no-format', dest='format_markdown',
+                        action='store_false',
+                        help='Disable glow markdown formatting in non-interactive mode')
     args = parser.parse_args()
 
     if args.session == '__list__':
@@ -1336,6 +1364,7 @@ def main():
         config.api_base = args.api_base_cli
     if args.cwd:
         config.cwd = Path(args.cwd).expanduser()
+    config.format_markdown = args.format_markdown
 
     # Create and run agent
     agent = BasicCodingAgent(config, args.session)
