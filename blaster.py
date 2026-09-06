@@ -1097,6 +1097,88 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
             print(f"  {who}: {text}")
         print(_c("— end of previous conversation —", "dim"))
 
+    def _run_turn(self) -> Optional[str]:
+        """Run one full user turn: LLM call plus tool execution loop.
+
+        The user message has already been appended to self.messages. Returns
+        the final assistant text ('' if the model produced none).
+        """
+        response = self._call_llm(self.messages)
+        choice = response.choices[0]
+        if not choice:
+            raise RuntimeError("empty response from LLM")
+
+        # Tool execution loop: keep feeding results back to the model until it
+        # answers without another tool call.
+        tool_rounds = 0
+        while True:
+            tool_calls = self._parse_tool_calls(response)
+            if not tool_calls:
+                break
+
+            tool_rounds += 1
+            if tool_rounds > 12:
+                print(_c("⚠️  Too many tool rounds - stopping to avoid a loop.", "red"))
+                self.messages.append(Message(
+                    role="user",
+                    content="(system) Tool round limit reached (12). Stop calling tools and answer now.",
+                    timestamp=datetime.now().isoformat()
+                ))
+                response = self._call_llm(self.messages)
+                break
+
+            print(f"\n🔧 {_c(f'Executing {len(tool_calls)} tool(s)...', 'bold')}")
+
+            # Echo the assistant tool-call message so the model sees what
+            # arguments it used (required before tool results).
+            self.messages.append(Message(
+                role="assistant",
+                content="",
+                tool_calls=[tc for tc in tool_calls],
+                timestamp=datetime.now().isoformat()
+            ))
+
+            for tool_call in tool_calls:
+                tool_name = tool_call.function['name']
+                result = self._execute_tool(tool_call)
+                self._print_tool_result(tool_name, result)
+                self._add_tool_response(tool_call, result)
+
+            print("🤖 " + _c("Getting next response...", "dim"))
+            response = self._call_llm(self.messages)
+            if not response.choices or not response.choices[0]:
+                raise RuntimeError("empty response from LLM")
+
+        choice = response.choices[0]
+        assistant_message = (choice.get('message') or {}).get('content') or ""
+        if assistant_message:
+            self.messages.append(Message(
+                role="assistant",
+                content=assistant_message,
+                timestamp=datetime.now().isoformat()
+            ))
+
+        # Update token usage
+        usage = response.usage
+        self.total_tokens_used += usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)
+
+        return assistant_message
+
+    def run_once(self, prompt: str) -> str:
+        """Non-interactive mode: run a single prompt and return the answer."""
+        self.messages.append(Message(
+            role="user",
+            content=prompt,
+            timestamp=datetime.now().isoformat()
+        ))
+        try:
+            answer = self._run_turn()
+        finally:
+            if self.session_context:
+                self._save_session()
+        print(f"\n🤖 {_c(answer, 'green')}")
+        return answer
+
     def run(self):
         """Main interaction loop"""
         print(_c("Blaster — server ops & coding agent", "bold"))
@@ -1130,71 +1212,12 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                     timestamp=datetime.now().isoformat()
                 ))
 
-                response = self._call_llm(self.messages)
-                choice = response.choices[0]
-                if not choice:
-                    print(_c("Error: empty response from LLM", "red"))
-                    continue
-
-                # Tool execution loop: keep feeding results back to the model
-                # until it answers without another tool call.
-                tool_rounds = 0
-                while True:
-                    tool_calls = self._parse_tool_calls(response)
-                    if not tool_calls:
-                        break
-
-                    tool_rounds += 1
-                    if tool_rounds > 12:
-                        print(_c("⚠️  Too many tool rounds - stopping to avoid a loop.", "red"))
-                        self.messages.append(Message(
-                            role="user",
-                            content="(system) Tool round limit reached (12). Stop calling tools and answer now.",
-                            timestamp=datetime.now().isoformat()
-                        ))
-                        response = self._call_llm(self.messages)
-                        break
-
-                    print(f"\n🔧 {_c(f'Executing {len(tool_calls)} tool(s)...', 'bold')}")
-
-                    # Echo the assistant tool-call message so the model sees
-                    # what arguments it used (required before tool results).
-                    self.messages.append(Message(
-                        role="assistant",
-                        content="",
-                        tool_calls=[tc for tc in tool_calls],
-                        timestamp=datetime.now().isoformat()
-                    ))
-
-                    for tool_call in tool_calls:
-                        tool_name = tool_call.function['name']
-                        result = self._execute_tool(tool_call)
-                        self._print_tool_result(tool_name, result)
-                        self._add_tool_response(tool_call, result)
-
-                    print("🤖 " + _c("Getting next response...", "dim"))
-                    response = self._call_llm(self.messages)
-                    if not response.choices or not response.choices[0]:
-                        print(_c("Error: empty response from LLM", "red"))
-                        break
-
-                # Get final response
-                choice = response.choices[0]
-                assistant_message = (choice.get('message') or {}).get('content') or ""
-                if assistant_message:
-                    self.messages.append(Message(
-                        role="assistant",
-                        content=assistant_message,
-                        timestamp=datetime.now().isoformat()
-                    ))
-                    print(f"\n🤖 {_c(assistant_message, 'green')}")
-
-                # Update token usage
-                usage = response.usage
-                self.total_tokens_used += usage.get('prompt_tokens', 0) + usage.get('completion_tokens', 0)
-                p, c = usage.get('prompt_tokens', 0), usage.get('completion_tokens', 0)
-                print(f"\n💰 {_c(f'Tokens: {p} + {c} = {p + c}', 'dim')}"
-                      f" {_c(f'(session: {self.total_tokens_used})', 'dim')}")
+                try:
+                    self._run_turn()
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    print(_c(f"Error: {e}", "red"))
 
                 # Auto-save session after every interaction
                 if self.session_context:
@@ -1273,6 +1296,8 @@ def main():
                         help='Session name to load; bare --session lists saved sessions')
     parser.add_argument('--cwd', type=str, default=None,
                         help='Working directory for tools (default: current dir)')
+    parser.add_argument('-p', '--prompt', type=str, default=None,
+                        help='Non-interactive mode: run a single prompt and exit')
 
     args = parser.parse_args()
 
@@ -1292,6 +1317,12 @@ def main():
 
     # Create and run agent
     agent = BasicCodingAgent(config, args.session)
+
+    # Non-interactive mode: run a single prompt and exit.
+    if args.prompt:
+        agent.run_once(args.prompt)
+        return
+
     agent.run()
 
 
