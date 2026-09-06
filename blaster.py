@@ -13,7 +13,7 @@ Usage:
                       [--cwd DIR] [--session NAME]
 Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (for remote endpoints)
 """
-import argparse, json, os, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request
+import argparse, json, os, random, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request, uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -73,6 +73,7 @@ class LLMResponse:
 @dataclass
 class SessionContext:
     session_id: str
+    name: str
     created_at: str
     last_accessed: str
     message_count: int
@@ -302,113 +303,132 @@ class BasicCodingAgent:
         # Setup sessions directory
         self.config.sessions_dir.mkdir(parents=True, exist_ok=True)
 
-        # Only load session if explicitly requested, otherwise create new session
+        # Sessions are identified by a unique id and a human-friendly name
+        # describing the task. Load a session by name if one was given,
+        # otherwise start a fresh session with an auto-generated name.
         if session_name:
             self._load_or_create_session(session_name)
         else:
-            # Create new session without loading previous one
-            session_name = self._generate_session_name()
-            self._create_new_session(session_name)
+            self._create_new_session(self._generate_session_name())
 
         # Initialize with system prompt
         self._initialize_system_prompt()
 
-    def _generate_session_name(self) -> str:
-        """Generate a session name based on the current project directory"""
-        # Use the directory name as the session name
-        dir_name = self.project_root.name
+    @staticmethod
+    def _generate_session_name() -> str:
+        """Generate a human-friendly session name (adjective-noun)."""
+        adjectives = [
+            "amber", "brave", "clever", "cosmic", "crimson", "daring", "echo",
+            "electric", "fierce", "golden", "gentle", "hushed", "jade", "lively",
+            "lunar", "mighty", "nimble", "noble", "oceanic", "quiet", "radiant",
+            "restless", "silver", "silent", "steel", "swift", "tender", "vivid",
+            "wandering", "winter",
+        ]
+        nouns = [
+            "badger", "beacon", "bear", "beetle", "breeze", "cascade", "comet",
+            "condor", "coyote", "crane", "dolphin", "eagle", "falcon", "fox",
+            "gazelle", "gecko", "glacier", "heron", "horizon", "jaguar", "lantern",
+            "lynx", "maple", "meadow", "otter", "pine", "raven", "river", "sable",
+            "salamander", "sojourn", "sparrow", "summit", "thunder", "voyage",
+            "willow", "wren", "zephyr",
+        ]
+        return f"{random.choice(adjectives)}-{random.choice(nouns)}"
 
-        # If we're in the home directory or root, use a generic name
-        if dir_name == "" or str(self.project_root) == str(Path.home()):
-            dir_name = "default"
+    @staticmethod
+    def _generate_session_id() -> str:
+        """Generate a unique session id (used as the storage filename)."""
+        return uuid.uuid4().hex[:12]
 
-        # Clean the session name (remove special characters)
-        session_name = re.sub(r'[^\w\-_]', '_', dir_name)
+    def _load_or_create_session(self, name: str):
+        """Load a session by name, or create a fresh one if none exists.
 
-        return session_name
+        Sessions identify tasks, not directories, so the name is matched
+        across every saved session regardless of project.
+        """
+        target = self._find_session_by_name(name)
+        if target is None:
+            self._create_new_session(name)
+            return
 
-    def _auto_create_session(self):
-        """Automatically create or load session based on project directory"""
-        session_name = self._generate_session_name()
-        self._load_or_create_session(session_name)
+        try:
+            session_file, session_data = target
+            context_data = session_data.get('context', {})
 
-    def _load_or_create_session(self, session_name: str):
-        """Load existing session or create new one"""
-        session_file = self.config.sessions_dir / f"{session_name}.json"
+            self.session_context = SessionContext(
+                session_id=context_data.get('session_id', session_file.stem),
+                name=context_data.get('name', name),
+                created_at=context_data.get('created_at', datetime.now().isoformat()),
+                last_accessed=datetime.now().isoformat(),
+                message_count=context_data.get('message_count', 0),
+            )
 
-        if session_file.exists():
+            # Load conversation summary
+            self.conversation_summary = session_data.get('conversation_summary', '')
+            self.total_tokens_used = session_data.get('total_tokens', 0)
+
+            # Load previous messages (limited to recent ones for context)
+            saved_messages = session_data.get('messages', [])
+            if saved_messages:
+                recent_messages = saved_messages[-100:]  # Load last 100
+                for msg_data in recent_messages:
+                    role = msg_data.get('role', 'user')
+                    content = msg_data.get('content', '')
+                    if role == 'system':
+                        # The saved file carries the old system prompt;
+                        # a fresh one is added when the agent starts.
+                        continue
+                    if role == 'tool':
+                        # Persisted tool messages carry the call id in
+                        # the timestamp slot of older sessions; just
+                        # synthesize a placeholder name so reloading
+                        # produces a well-formed tool result.
+                        self.messages.append(Message(
+                            role='tool',
+                            content=content,
+                            tool_call_id=msg_data.get('tool_call_id', 'legacy'),
+                            name=msg_data.get('name', 'tool'),
+                            timestamp=msg_data.get('timestamp')
+                        ))
+                    else:
+                        self.messages.append(Message(
+                            role=role,
+                            content=content,
+                            timestamp=msg_data.get('timestamp')
+                        ))
+
+            print(f"📂 Loaded session '{self.session_context.name}' "
+                  f"({len(saved_messages)} previous messages, will be saved on quit)")
+
+        except Exception as e:
+            print(f"⚠️  Could not load session: {e}. Starting fresh session.")
+            self._create_new_session(name)
+
+    def _find_session_by_name(self, name: str):
+        """Return (session_file, session_data) for a saved session with this name."""
+        for session_file in sorted(self.config.sessions_dir.glob("*.json"),
+                                   key=lambda p: p.stat().st_mtime, reverse=True):
             try:
-                with open(session_file, 'r', encoding='utf-8') as f:
-                    session_data = json.load(f)
+                data = json.loads(session_file.read_text(encoding="utf-8"))
+                ctx = data.get("context", {})
+                saved_name = ctx.get("name", ctx.get("session_id", session_file.stem))
+                if saved_name == name:
+                    return session_file, data
+            except Exception:
+                continue
+        return None
 
-                # Check if this session is from the same project
-                context_data = session_data.get('context', {})
-                saved_project_root = context_data.get('project_root', '')
-
-                if saved_project_root == str(self.project_root):
-                    # Load session context
-                    self.session_context = SessionContext(
-                        session_id=context_data.get('session_id', session_name),
-                        created_at=context_data.get('created_at', datetime.now().isoformat()),
-                        last_accessed=datetime.now().isoformat(),
-                        message_count=context_data.get('message_count', 0),
-                    )
-
-                    # Load conversation summary
-                    self.conversation_summary = session_data.get('conversation_summary', '')
-                    self.total_tokens_used = session_data.get('total_tokens', 0)
-
-                    # Load previous messages (limited to recent ones for context)
-                    saved_messages = session_data.get('messages', [])
-                    if saved_messages:
-                        recent_messages = saved_messages[-100:]  # Load last 100
-                        for msg_data in recent_messages:
-                            role = msg_data.get('role', 'user')
-                            content = msg_data.get('content', '')
-                            if role == 'system':
-                                # The saved file carries the old system prompt;
-                                # a fresh one is added when the agent starts.
-                                continue
-                            if role == 'tool':
-                                # Persisted tool messages carry the call id in
-                                # the timestamp slot of older sessions; just
-                                # synthesize a placeholder name so reloading
-                                # produces a well-formed tool result.
-                                self.messages.append(Message(
-                                    role='tool',
-                                    content=content,
-                                    tool_call_id=msg_data.get('tool_call_id', 'legacy'),
-                                    name=msg_data.get('name', 'tool'),
-                                    timestamp=msg_data.get('timestamp')
-                                ))
-                            else:
-                                self.messages.append(Message(
-                                    role=role,
-                                    content=content,
-                                    timestamp=msg_data.get('timestamp')
-                                ))
-
-                    print(f"📂 Loaded session '{session_name}' ({len(saved_messages)} previous messages, will be saved on quit)")
-                else:
-                    # Different project, create new session
-                    print(f"📝 New project detected, creating fresh session '{session_name}'")
-                    self._create_new_session(session_name)
-
-            except Exception as e:
-                print(f"⚠️  Could not load session: {e}. Starting fresh session.")
-                self._create_new_session(session_name)
-        else:
-            self._create_new_session(session_name)
-
-    def _create_new_session(self, session_name: str):
-        """Create a new session"""
+    def _create_new_session(self, name: Optional[str] = None):
+        """Create a new session, generating a unique id and a name if needed."""
+        if not name:
+            name = self._generate_session_name()
         self.session_context = SessionContext(
-            session_id=session_name,
+            session_id=self._generate_session_id(),
+            name=name,
             created_at=datetime.now().isoformat(),
             last_accessed=datetime.now().isoformat(),
             message_count=0,
         )
-        print(f"📝 Created new session '{session_name}' (will be saved on quit)")
+        print(f"📝 Created new session '{name}' (will be saved on quit)")
 
     def _save_session(self):
         """Save current session to disk"""
@@ -426,6 +446,7 @@ class BasicCodingAgent:
             session_data = {
                 'context': {
                     'session_id': self.session_context.session_id,
+                    'name': self.session_context.name,
                     'created_at': self.session_context.created_at,
                     'last_accessed': self.session_context.last_accessed,
                     'message_count': self.session_context.message_count,
@@ -502,7 +523,8 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
 
         session_info = []
         session_info.append("Session Context:")
-        session_info.append(f"  Session: {self.session_context.session_id}")
+        session_info.append(f"  Session: {self.session_context.name}")
+        session_info.append(f"  ID: {self.session_context.session_id}")
         session_info.append(f"  Created: {self.session_context.created_at.split('T')[0]}")
 
         if self.conversation_summary:
@@ -1186,7 +1208,8 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         print(f"  {_c('Model:', 'cyan')}   {self.config.model}")
         print(f"  {_c('API:', 'cyan')}     {self.config.api_base}")
         if self.session_context:
-            print(f"  {_c('Session:', 'cyan')} {self.session_context.session_id} (auto-saved)")
+            print(f"  {_c('Session:', 'cyan')} {self.session_context.name} "
+                  f"({self.session_context.session_id}, auto-saved)")
         print(_c("Type 'quit' to exit. Ctrl+C to interrupt.", "dim"))
         self._show_past_messages()
         print()
@@ -1199,7 +1222,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                 if user_input.lower() in ['quit', 'exit', 'q']:
                     if self.session_context:
                         self._save_session()
-                        print(f"💾 {_c('Session saved', 'green')}: {self.session_context.session_id}")
+                        print(f"💾 {_c('Session saved', 'green')}: {self.session_context.name}")
                     break
 
                 if not user_input:
@@ -1226,7 +1249,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
             except KeyboardInterrupt:
                 if self.session_context:
                     self._save_session()
-                    print(f"\n💾 {_c('Session saved', 'green')}: {self.session_context.session_id}")
+                    print(f"\n💾 {_c('Session saved', 'green')}: {self.session_context.name}")
                 print("Goodbye!")
                 break
             except Exception as e:
@@ -1264,22 +1287,21 @@ def _show_sessions(sessions_dir: Path) -> None:
         print(f"(sessions are stored in {sessions_dir})")
         return
 
-    hdr = (f"{_c('SESSION', 'bold'):<22} {_c('MSGS', 'bold'):>5}  "
-           f"{_c('CREATED', 'bold'):<10}  {_c('LAST USED', 'bold'):<10}  "
-           f"{_c('PROJECT', 'bold')}")
+    hdr = (f"{_c('NAME', 'bold'):<22} {_c('ID', 'bold'):<14} {_c('MSGS', 'bold'):>5}  "
+           f"{_c('CREATED', 'bold'):<10}  {_c('LAST USED', 'bold'):<10}")
     print(hdr)
     print("-" * len(hdr))
     for f in files:
         try:
             ctx = json.loads(f.read_text(encoding="utf-8")).get("context", {})
-            name = ctx.get("session_id", f.stem)
+            name = ctx.get("name", ctx.get("session_id", f.stem))
+            sid = ctx.get("session_id", f.stem)[:12]
             msgs = ctx.get("message_count", "?")
             created = (ctx.get("created_at") or "?")[:10]
             last = (ctx.get("last_accessed") or "?")[:10]
-            proj = ctx.get("project_root", "?")
         except Exception:
-            name, msgs, created, last, proj = f.stem, "?", "?", "?", "?"
-        print(f"{name:<22} {str(msgs):>5}  {created:<10}  {last:<10}  {proj}")
+            name, sid, msgs, created, last = f.stem, f.stem[:12], "?", "?", "?"
+        print(f"{name:<22} {sid:<14} {str(msgs):>5}  {created:<10}  {last:<10}")
     print()
     print(_c("Resume one with: python blaster.py --session NAME", "dim"))
 
