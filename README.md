@@ -19,7 +19,10 @@ It's optimized for **local models** (Ollama / llama.cpp): lightweight context, n
 - **Safety prompts**: destructive commands (`rm -rf`, `mkfs`, `dd`, ...) and anything using `sudo` ask for y/N approval before running; declined commands stay blocked for the session
 - **Local-first**: defaults to `http://localhost:11434/v1` (Ollama) with no API key required
 - **Any OpenAI-compatible backend**: Ollama, llama.cpp, OpenRouter, OpenAI, vLLM, etc.
-- **Persistent sessions**: conversation history auto-saved per working directory
+- **Persistent sessions**: named conversations (e.g. `daring-horizon`) auto-saved and resumable across directories
+- **Non-interactive mode**: `-p "prompt"` runs a single prompt and exits — scriptable from cron, CI, or other tools
+- **Markdown rendering**: non-interactive answers are rendered with `glow` when it's installed and stdout is a TTY (`-x`/`--no-format` disables)
+- **Live feedback**: `run_shell` shows the exact command before it runs, `edit_file` shows a colored diff of what changes
 - **Enhanced terminal**: arrow-key history, cursor movement, Ctrl+A/E/U shortcuts (falls back to plain `input()` when piped)
 
 ## Tools
@@ -74,6 +77,13 @@ python blaster.py --cwd /srv/myapp
 # Resume a named session (bare --session lists saved sessions)
 python blaster.py --session prod-setup
 python blaster.py --session
+
+# Non-interactive: run one prompt and exit (scriptable)
+python blaster.py -p "check disk usage and report the top 5 largest dirs"
+
+# Disable markdown rendering / sessions
+python blaster.py -p "..." -x
+python blaster.py -s
 ```
 
 ### Command-line options
@@ -83,8 +93,11 @@ python blaster.py --session
 | `--model` | `BLASTER_MODEL` or `qwen3.8:27b` | Model name |
 | `--api-base` | `BLASTER_API_BASE` or `http://localhost:11434/v1` | OpenAI-compatible API base URL |
 | `--cwd` | current directory | Working directory for all tools |
+| `-p`/`--prompt` | — | Non-interactive mode: run a single prompt and exit |
 | `-n`/`--max-iteration` | 50 | Max tool rounds per turn (safety limit to prevent loops) |
-| `--session` | auto (directory name) | Session name to load/resume; bare `--session` lists sessions |
+| `--session` | auto (random name) | Session name to load/resume; bare `--session` lists sessions |
+| `-x`/`--no-format` | off | Disable `glow` markdown rendering in non-interactive mode |
+| `-s`/`--no-session` | off | Disable sessions entirely (no load, create, or save) |
 
 ### Environment variables
 
@@ -144,6 +157,8 @@ class Config:
     max_iterations: int = 50        # tool round limit per turn
     sessions_dir: Path = Path.home() / ".blaster" / "sessions"
     cwd: Path = Path.cwd()
+    format_markdown: bool = True    # render non-interactive answers with glow
+    session_enabled: bool = True    # -s/--no-session disables all session I/O
 ```
 
 ### Safety rules
@@ -161,7 +176,7 @@ A declined command is remembered for the session so the model cannot silently re
 
 ## Sessions
 
-Conversations auto-save after every turn to `~/.blaster/sessions/<name>.json`, where `<name>` defaults to the working directory name (override with `--session`; bare `python blaster.py --session` lists saved sessions). On resume the last 100 messages are restored and shown as a recap, and the per-turn context window is capped at 100 messages to protect the model's context.
+Conversations auto-save after every turn to `~/.blaster/sessions/<session_id>.json`. Each session gets a unique id (the filename) and a human-friendly name — auto-generated as an adjective-noun pair (e.g. `daring-horizon`) unless you pass `--session NAME`. Sessions identify tasks, not directories: `--session` matches by name across every saved session, so you can resume one from any working directory. Bare `python blaster.py --session` lists saved sessions (name, id, message count, created/last-used). On resume the last 100 messages are restored and shown as a recap, and the per-turn context window is capped at 100 messages to protect the model's context. Use `-s`/`--no-session` to skip all session loading and saving.
 
 ## Architecture
 
@@ -172,6 +187,7 @@ The file is organized as:
 3. **`EnhancedInput`** — raw-mode line editor (history, cursor keys, Ctrl+A/E/U), plain `input()` fallback when stdin isn't a TTY
 4. **`_TOOL_SPECS` / `_get_tools()`** — the tool schemas advertised to the model; add a tool by appending one tuple
 5. **`BasicCodingAgent`** — orchestration: session load/save, system prompt, LLM calls (JSON or streaming NDJSON), message trimming, the tool-execution loop (with a configurable round guard, default 50), and the file/shell tool implementations
+6. **`main()`** — CLI parsing (`--model`, `--api-base`, `--cwd`, `--session`, `-p`, `-n`, `-x`, `-s`), interactive loop, and non-interactive single-prompt mode
 
 ### Data flow
 
@@ -203,8 +219,8 @@ Adjust `max_file_size` in `Config`, or use `run_shell` (e.g. `tail`, `head`) for
 **Model isn't calling tools reliably**
 Prefer a model with solid function calling (e.g. `qwen3.8:27b`, `devstral`). Check `ollama list`; some small models handle tool use poorly.
 
-**Session not resuming from another directory**
-Sessions are tied to the working directory. Pass `--session NAME` to force-load a specific one.
+**Session not resuming**
+Sessions are matched by name across all saved sessions (not tied to a directory). Check the exact name with bare `python blaster.py --session`, then pass it with `--session NAME`.
 
 ## Development
 

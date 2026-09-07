@@ -13,7 +13,7 @@ Usage:
                       [--cwd DIR] [--session NAME] [-s] [-n MAX_ITERATION]
 Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (optional; only sent when set)
 """
-import argparse, json, os, random, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request, uuid
+import argparse, difflib, json, os, random, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request, uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1197,9 +1197,13 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                     except json.JSONDecodeError:
                         cmd = tool_call.function.get('arguments', '')
                     print(f"  💻 run_shell: {_c('$ ', 'cyan')}{_c(cmd, 'cyan')}")
+                elif tool_name == "edit_file":
+                    self._print_edit_diff(tool_call)
                 result = self._execute_tool(tool_call)
                 self._print_tool_result(tool_name, result)
                 self._add_tool_response(tool_call, result)
+                # Debug: ensure output is flushed after each tool
+                sys.stdout.flush()
 
             print("🤖 " + _c("Getting next response...", "dim"))
             response = self._call_llm(self.messages)
@@ -1293,6 +1297,36 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
             except Exception as e:
                 print(_c(f"Error: {e}", "red"))
                 # Don't break on errors, continue the loop
+
+    def _print_edit_diff(self, tool_call: ToolCall):
+        """Show a colored diff of what an edit_file call removes and adds."""
+        try:
+            args = json.loads(tool_call.function.get('arguments', '{}'))
+        except json.JSONDecodeError:
+            return
+        before = args.get('before', '')
+        after = args.get('after', '')
+        path = args.get('path', '')
+        if not before and not after:
+            return
+
+        print(f"  ✏️  {_c('edit_file:', 'green')} {_c(path, 'cyan')}")
+        diff = difflib.unified_diff(
+            before.splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile="before", tofile="after", lineterm="",
+        )
+        for line in diff:
+            # unified_diff lines end with '\n' or are headers; strip it.
+            text = line.rstrip("\n")
+            if text.startswith("+++") or text.startswith("---"):
+                continue  # skip file headers, we already printed the path
+            if text.startswith("+"):
+                print("    " + _c(text, "green"))
+            elif text.startswith("-"):
+                print("    " + _c(text, "red"))
+            else:
+                print("    " + _c(text, "dim"))
 
     def _print_tool_result(self, tool_name: str, result: str):
         """Show a concise one-line summary of a tool result."""
