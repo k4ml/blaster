@@ -1212,12 +1212,13 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
 
         choice = response.choices[0]
         assistant_message = (choice.get('message') or {}).get('content') or ""
-        if assistant_message:
-            self.messages.append(Message(
-                role="assistant",
-                content=assistant_message,
-                timestamp=datetime.now().isoformat()
-            ))
+        if not assistant_message:
+            assistant_message = "(no response)"
+        self.messages.append(Message(
+            role="assistant",
+            content=assistant_message,
+            timestamp=datetime.now().isoformat()
+        ))
 
         # Update token usage
         usage = response.usage
@@ -1237,7 +1238,9 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         finally:
             if self.session_context:
                 self._save_session()
-        if self.config.format_markdown and _USE_COLOR:
+        if answer == "(no response)":
+            print(_c("🤖 (no response from model)", "dim"))
+        elif self.config.format_markdown and _USE_COLOR:
             _render_markdown(f"\n{answer}")
         else:
             print(f"\n🤖 {_c(answer, 'green')}")
@@ -1278,11 +1281,16 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                 ))
 
                 try:
-                    self._run_turn()
+                    answer = self._run_turn()
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
                     print(_c(f"Error: {e}", "red"))
+
+                if answer and answer != "(no response)":
+                    print(f"\n🤖 {_c(answer, 'green')}")
+                elif answer == "(no response)":
+                    print(_c("\n🤖 (no response from model)", "dim"))
 
                 # Auto-save session after every interaction
                 if self.session_context:
