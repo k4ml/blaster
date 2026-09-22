@@ -23,6 +23,7 @@ It's optimized for **local models** (Ollama / llama.cpp): lightweight context, n
 - **Persistent sessions**: named conversations (e.g. `daring-horizon`) auto-saved and resumable across directories
 - **Non-interactive mode**: `-p "prompt"` runs a single prompt and exits — scriptable from cron, CI, or other tools
 - **Markdown rendering**: non-interactive answers are rendered with `glow` when it's installed and stdout is a TTY (`-x`/`--no-format` disables)
+- **Live "thinking" indicator**: responses are streamed (`stream: true`), so long generations don't time out the connection. A spinner animates during prefill, then for reasoning models (qwen3, etc.) the reasoning streams via `delta.reasoning` and is shown as a collapsed `Thinking ... (N lines) [Ctrl+O to expand]` line that updates live — press Ctrl+O to expand it inline. The answer streams inline after. (All this is TTY-only; when piped, reasoning stays silent and the answer streams plain text.)
 - **Live feedback**: `run_shell` shows the exact command before it runs, `edit_file` shows a colored diff of what changes
 - **Enhanced terminal**: arrow-key history, cursor movement, Ctrl+A/E/U shortcuts (falls back to plain `input()` when piped)
 
@@ -100,6 +101,7 @@ python blaster.py -w -p "add a docstring to utils.py and fix the typo in config.
 | `--cwd` | current directory | Working directory for all tools |
 | `-p`/`--prompt` | — | Non-interactive mode: run a single prompt and exit |
 | `-n`/`--max-iteration` | 50 | Max tool rounds per turn (safety limit to prevent loops) |
+| `-t`/`--timeout` | 300 | LLM request timeout in seconds (per socket read; streaming keeps it alive during generation) |
 | `-w`/`--write` | off | Enable edit mode: allow `write_file`/`edit_file` to modify files (blocked by default for safety) |
 | `--session` | auto (random name) | Session name to load/resume; bare `--session` lists sessions |
 | `-x`/`--no-format` | off | Disable `glow` markdown rendering in non-interactive mode |
@@ -156,7 +158,7 @@ class Config:
     model: str = os.getenv("BLASTER_MODEL", "qwen3.8:27b")
     max_tokens: int = 2000          # response length cap
     temperature: float = 0.2
-    request_timeout: int = 120      # LLM HTTP timeout (seconds)
+    request_timeout: int = 300      # LLM HTTP timeout (seconds); -t/--timeout
     max_context_files: int = 20     # entries shown in the startup context
     max_file_size: int = 100_000    # read_file cap (bytes)
     max_output_chars: int = 40_000  # run_shell output cap (chars)
@@ -202,10 +204,10 @@ The file is organized as:
 
 1. **`Config` + safety patterns** — endpoint/model defaults and the approval regexes
 2. **Dataclasses** — `Message`, `ToolCall`, `LLMResponse`, `SessionContext`, `BashToolResult`
-3. **`EnhancedInput`** — raw-mode line editor (history, cursor keys, Ctrl+A/E/U), plain `input()` fallback when stdin isn't a TTY
+3. **`EnhancedInput` / `_Spinner` / `_ThinkingPanel`** — raw-mode line editor (history, cursor keys, Ctrl+A/E/U) with plain `input()` fallback when piped; a prefill spinner; and a collapsed reasoning panel (`Thinking ... (N lines) [Ctrl+O to expand]`, TTY-only)
 4. **`_TOOL_SPECS` / `_get_tools()`** — the tool schemas advertised to the model; add a tool by appending one tuple
-5. **`BasicCodingAgent`** — orchestration: session load/save, system prompt, LLM calls (JSON or streaming NDJSON), message trimming, the tool-execution loop (with a configurable round guard, default 50), and the file/shell tool implementations
-6. **`main()`** — CLI parsing (`--model`, `--api-base`, `--cwd`, `--session`, `-p`, `-n`, `-w`, `-x`, `-s`), interactive loop, and non-interactive single-prompt mode
+5. **`BasicCodingAgent`** — orchestration: session load/save, system prompt, streaming LLM calls (`stream: true`, with live reasoning/answer output via `_read_stream`), message trimming, the tool-execution loop (with a configurable round guard, default 50), and the file/shell tool implementations
+6. **`main()`** — CLI parsing (`--model`, `--api-base`, `--cwd`, `--session`, `-p`, `-n`, `-t`, `-w`, `-x`, `-s`), interactive loop, and non-interactive single-prompt mode
 
 ### Data flow
 

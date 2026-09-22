@@ -15,7 +15,7 @@ Usage:
                       [--cwd DIR] [--session NAME] [-w] [-s] [-n MAX_ITERATION]
 Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (optional; only sent when set)
 """
-import argparse, difflib, json, os, random, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request, uuid
+import argparse, difflib, itertools, json, os, random, re, select, shutil, subprocess, sys, termios, threading, time, tty, urllib.error, urllib.request, uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -30,7 +30,7 @@ class Config:
     model: str = os.getenv("BLASTER_MODEL", "qwen3.8:27b")
     max_tokens: int = 2000
     temperature: float = 0.2
-    request_timeout: int = 120
+    request_timeout: int = 300
     max_context_files: int = 20
     max_file_size: int = 100_000        # read_file cap (100KB)
     max_output_chars: int = 40_000      # run_shell output cap
@@ -271,6 +271,167 @@ def _render_markdown(text: str) -> None:
         proc.communicate(text.encode(), timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         print(text)
+
+
+class _Spinner:
+    """Animate a "thinking" indicator while the LLM is generating.
+
+    Only animates on a real TTY (ANSI cursor codes); when stdout is piped it
+    prints a single plain line so scripted runs still get feedback without
+    emitting control codes. Runs on a daemon thread so it can't outlive the
+    process, and self-clears its line on stop.
+    """
+
+    _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, label: str = "Thinking"):
+        self._label = label
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if not _USE_COLOR:
+            # Piped/non-TTY: one plain line, no escape codes.
+            print(f"🤖 {self._label}...", flush=True)
+            return
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._thread.start()
+
+    def _spin(self):
+        i = 0
+        while not self._stop.is_set():
+            frame = self._FRAMES[i % len(self._FRAMES)]
+            sys.stdout.write(f"\r🤖 {frame} {self._label}...")
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.1)
+        sys.stdout.write("\r\x1b[K")  # clear the spinner line
+        sys.stdout.flush()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+            self._thread = None
+
+
+class _ThinkingPanel:
+    """Collapsed live 'Thinking ... (N lines) [Ctrl+O to expand]' panel.
+
+    Fed reasoning tokens (delta.reasoning / reasoning_content / thinking) as
+    they stream. On a TTY it renders a single updating line with the line
+    count and a Ctrl+O hint; stdin is put in cbreak mode so a single Ctrl+O
+    (or 'o') expands the reasoning inline. On a pipe it stays silent (no
+    control codes) — reasoning simply isn't shown collapsed. end() clears the
+    line and drains/restores the terminal so a buffered Ctrl+O can't leak into
+    cooked mode (where it is stty DISCARD and would hide output).
+    """
+
+    def __init__(self):
+        self._buf: List[str] = []
+        self._expanded = False
+        self._shown = False          # counter line currently on screen
+        self._cbreak = False
+        self._old = None
+
+    def begin(self):
+        self._enter_cbreak()
+
+    def feed(self, text: str):
+        self._buf.append(text)
+        if self._expanded:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            return
+        if not _USE_COLOR:
+            return  # piped: stay silent (no \r garbage in captured output)
+        n = self._line_count()
+        label = "line" if n == 1 else "lines"
+        sys.stdout.write(f"\r🤖 Thinking ... ({n} {label}) [Ctrl+O to expand]")
+        sys.stdout.flush()
+        self._shown = True
+        self._maybe_expand()
+
+    def _line_count(self) -> int:
+        txt = "".join(self._buf)
+        n = txt.count("\n")
+        if txt and not txt.endswith("\n"):
+            n += 1
+        return max(n, 1)
+
+    def _enter_cbreak(self):
+        if not _USE_COLOR or self._cbreak:
+            return
+        try:
+            fd = sys.stdin.fileno()
+            self._old = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+            self._cbreak = True
+        except Exception:
+            self._cbreak = False
+
+    def _maybe_expand(self):
+        if not self._cbreak:
+            return
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], 0)
+            if not r:
+                return
+            ch = sys.stdin.read(1)
+        except Exception:
+            return
+        if ch in ("\x0f", "o", "O"):  # Ctrl+O, or o
+            self._expand()
+
+    def _expand(self):
+        self._expanded = True
+        self._clear()
+        prefix = _c("💭 thinking", "dim") if _USE_COLOR else "thinking:"
+        sys.stdout.write(prefix + "\n" + "".join(self._buf))
+        sys.stdout.flush()
+
+    def _clear(self):
+        if self._shown and _USE_COLOR:
+            sys.stdout.write("\r\x1b[K")
+            sys.stdout.flush()
+            self._shown = False
+
+    def _drain_stdin(self):
+        if not self._cbreak:
+            return
+        try:
+            while True:
+                r, _, _ = select.select([sys.stdin], [], [], 0)
+                if not r:
+                    break
+                sys.stdin.read(1)
+        except Exception:
+            pass
+
+    def end(self):
+        self._clear()
+        self._drain_stdin()
+        self._restore()
+
+    def _restore(self):
+        if self._cbreak and self._old is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._old)
+            except Exception:
+                pass
+            self._cbreak = False
+
+    @property
+    def expanded(self) -> bool:
+        return self._expanded
+
+    @property
+    def has_reasoning(self) -> bool:
+        return bool(self._buf)
+
+    @property
+    def text(self) -> str:
+        return "".join(self._buf)
 
 
 # ---------------------------------------------------------------------------
@@ -603,15 +764,17 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
 
         return "\n".join(info)
 
-    def _call_llm(self, messages: List[Message]) -> LLMResponse:
+    def _call_llm(self, messages: List[Message], label: str = "Thinking") -> LLMResponse:
         """Call an OpenAI-compatible chat completions endpoint.
 
         Uses the local Ollama-style /chat/completions JSON API. Sends the
         `tools` array only when the tail of the conversation actually contains
         tool calls (or a system prompt that references them), which keeps the
-        prompt smaller and lets local models behave. Parses a non-streamed JSON
-        response; if the server returns NDJSON streaming deltas it reads them
-        and reassembles a normal-looking response object.
+        prompt smaller and lets local models behave. Streams the response
+        (`stream: true`) so tokens flow during generation — this keeps the
+        connection alive (no silent-hold timeout on long generations) and lets
+        a "thinking" spinner animate while the user waits. NDJSON/SSE stream
+        chunks are reassembled into a normal-looking response object.
         """
         # API key is optional for every endpoint: local servers (Ollama,
         # llama.cpp) and many remote gateways accept requests without one.
@@ -627,6 +790,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
             "messages": [self._message_to_dict(msg) for msg in history],
             "temperature": self.config.temperature,
             "max_tokens": self.config.max_tokens,
+            "stream": True,
         }
         if need_tools:
             payload["tools"] = _get_tools()
@@ -641,42 +805,150 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         body = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
+        spinner = _Spinner(label)
+        spinner.start()
+        self._content_streamed = False
         try:
             with urllib.request.urlopen(req, timeout=self.config.request_timeout) as response:
-                ctype = response.headers.get("Content-Type", "")
-                raw = response.read()
+                data, self._content_streamed = self._read_stream(response, spinner)
         except urllib.error.HTTPError as e:
             error_body = e.read().decode("utf-8", "replace") if e.fp else str(e)
             raise Exception(f"API Error {e.code}: {error_body}")
         except Exception as e:
             raise Exception(f"Request failed: {e}")
+        finally:
+            spinner.stop()
+
+        if data.get("error"):
+            raise Exception(f"API error: {data['error']}")
+        if not data.get("choices"):
+            raise Exception(f"Empty/unexpected API response: {str(data)[:500]}")
+        return LLMResponse(
+            choices=data["choices"],
+            usage=data.get("usage", {"prompt_tokens": 0, "completion_tokens": 0})
+        )
+
+    def _read_stream(self, response, spinner: "_Spinner"):
+        """Read an HTTP response stream, driving live reasoning + answer output.
+
+        Detects reasoning tokens (delta.reasoning / reasoning_content / thinking
+        — Ollama streams qwen3 reasoning via delta.reasoning) and routes them to
+        a _ThinkingPanel (collapsed 'Thinking ... (N lines) [Ctrl+O to expand]'
+        counter + inline expand). Answer content (delta.content) streams inline.
+        Returns (reassembled_data, content_streamed); content_streamed is True
+        when the answer was already printed and the caller must NOT reprint it.
+        Falls back to single-JSON parsing when the server ignores stream:true.
+        """
+        content_parts: List[str] = []
+        tool_calls_acc: Dict[str, Dict[str, Any]] = {}
+        finish_reason = None
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        panel = _ThinkingPanel()
+        saw_data = False
+        raw_buf: List[bytes] = []
+        mode = "prefill"     # prefill -> reasoning -> answer
+        answer_started = False
+        content_streamed = False
 
         try:
-            text = raw.decode("utf-8", "replace")
-        except Exception:
-            text = ""
+            for raw_line in response:
+                raw_buf.append(raw_line)
+                line = raw_line.decode("utf-8", "replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                saw_data = True
+                data_str = line[len("data:"):].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                if not chunk.get("choices"):
+                    if chunk.get("usage"):
+                        usage = chunk.get("usage")
+                    continue
+                choice = chunk["choices"][0]
+                delta = choice.get("delta", {}) or {}
 
-        if "application/x-ndjson" in ctype or text.lstrip().startswith("{"):
-            # Non-streamed: parse the single JSON object (or an NDJSON doc).
+                # Reasoning token (Ollama: delta.reasoning; others may use
+                # reasoning_content or thinking).
+                rtext = (delta.get("reasoning") or delta.get("reasoning_content")
+                         or delta.get("thinking"))
+                if rtext:
+                    if mode == "prefill":
+                        spinner.stop()
+                        mode = "reasoning"
+                        panel.begin()
+                    panel.feed(rtext)
+                    continue
+
+                # Answer content token — stream inline.
+                ctext = delta.get("content")
+                if ctext:
+                    if not answer_started:
+                        if mode == "reasoning":
+                            panel.end()
+                        else:
+                            spinner.stop()
+                        mode = "answer"
+                        answer_started = True
+                        sys.stdout.write("\n" + (_c("🤖 ", "green") if _USE_COLOR else "🤖 "))
+                        sys.stdout.flush()
+                    content_parts.append(ctext)
+                    sys.stdout.write(ctext)
+                    sys.stdout.flush()
+                    content_streamed = True
+
+                # Tool-call deltas (accumulated silently; _run_turn shows them).
+                for tc in delta.get("tool_calls", []) or []:
+                    idx = tc.get("index", 0)
+                    acc = tool_calls_acc.setdefault(
+                        idx, {"id": "", "type": "function",
+                              "function": {"name": "", "arguments": ""}})
+                    if tc.get("id"):
+                        acc["id"] = tc["id"]
+                    fn = tc.get("function", {}) or {}
+                    if fn.get("name"):
+                        acc["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        acc["function"]["arguments"] += fn["arguments"]
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
+        finally:
+            if mode == "reasoning":
+                panel.end()
+            elif mode == "prefill":
+                spinner.stop()
+            if content_streamed or panel.expanded:
+                last = "".join(content_parts)[-1:] if content_streamed else panel.text[-1:]
+                if last != "\n":
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+
+        # Non-streaming fallback: server ignored stream:true (single JSON body).
+        if not saw_data:
+            text = "".join(r.decode("utf-8", "replace") for r in raw_buf)
             try:
                 data = json.loads(text)
             except json.JSONDecodeError:
-                # Streaming fallback: server returned NDJSON lines.
                 data = self._parse_streaming_ndjson(text)
-            if data.get("error"):
-                raise Exception(f"API error: {data['error']}")
-            return LLMResponse(
-                choices=data.get("choices", []),
-                usage=data.get("usage",
-                               {"prompt_tokens": 0, "completion_tokens": 0})
-            )
+            return data, False
 
-        # Otherwise treat the body as NDJSON streaming chunks.
-        data = self._parse_streaming_ndjson(text)
-        if not data.get("choices"):
-            raise Exception(f"Empty/unexpected API response: {text[:500]}")
-        return LLMResponse(choices=data["choices"], usage=data.get("usage", {
-            "prompt_tokens": 0, "completion_tokens": 0}))
+        # Edge case: the whole answer routed into reasoning with empty content
+        # (observed on Ollama /v1 with qwen3). Surface the reasoning as answer.
+        if not content_parts and panel.has_reasoning:
+            content_parts = [panel.text]
+            content_streamed = panel.expanded
+
+        message: Dict[str, Any] = {}
+        if content_parts:
+            message["content"] = "".join(content_parts)
+        if tool_calls_acc:
+            message["tool_calls"] = [tool_calls_acc[k] for k in sorted(tool_calls_acc)]
+        data = {"choices": [{"message": message, "finish_reason": finish_reason}],
+                "usage": usage}
+        return data, content_streamed
 
     def _parse_streaming_ndjson(self, text: str) -> Dict:
         """Reassemble an OpenAI-style response from NDJSON stream chunks."""
@@ -1267,8 +1539,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                 # Debug: ensure output is flushed after each tool
                 sys.stdout.flush()
 
-            print("🤖 " + _c("Getting next response...", "dim"))
-            response = self._call_llm(self.messages)
+            response = self._call_llm(self.messages, "Getting next response")
             if not response.choices or not response.choices[0]:
                 raise RuntimeError("empty response from LLM")
 
@@ -1302,6 +1573,8 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                 self._save_session()
         if answer == "(no response)":
             print(_c("🤖 (no response from model)", "dim"))
+        elif self._content_streamed:
+            pass  # answer was streamed live; nothing more to print
         elif self.config.format_markdown and _USE_COLOR:
             _render_markdown(f"\n{answer}")
         else:
@@ -1354,7 +1627,8 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                     print(_c(f"Error: {e}", "red"))
 
                 if answer and answer != "(no response)":
-                    print(f"\n🤖 {_c(answer, 'green')}")
+                    if not self._content_streamed:
+                        print(f"\n🤖 {_c(answer, 'green')}")
                 elif answer == "(no response)":
                     print(_c("\n🤖 (no response from model)", "dim"))
 
@@ -1477,6 +1751,8 @@ def main():
     parser.add_argument('-w', '--write', dest='allow_edits', action='store_true',
                         help='Enable edit mode: allow write_file/edit_file to modify '
                              'files (safe/read-only by default)')
+    parser.add_argument('-t', '--timeout', dest='request_timeout', type=int,
+                        help='LLM request timeout in seconds (default: 300)')
     args = parser.parse_args()
 
     if args.session == '__list__':
@@ -1494,6 +1770,8 @@ def main():
         config.cwd = Path(args.cwd).expanduser()
     if args.max_iterations is not None:
         config.max_iterations = args.max_iterations
+    if args.request_timeout is not None:
+        config.request_timeout = args.request_timeout
     config.format_markdown = args.format_markdown
     config.session_enabled = args.session_enabled
     config.allow_edits = args.allow_edits
