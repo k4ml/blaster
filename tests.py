@@ -290,5 +290,73 @@ class TestThinkingPanel(unittest.TestCase):
         self.assertIn("Hello world.", out)        # answer still streams
 
 
+# ---------------------------------------------------------------------------
+# AGENTS.md project instructions
+# ---------------------------------------------------------------------------
+class TestAgentsMd(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self._old_depth = blaster.AGENTS_MD_MAX_DEPTH
+
+    def tearDown(self):
+        blaster.AGENTS_MD_MAX_DEPTH = self._old_depth
+        self._tmp.cleanup()
+
+    def _system(self, cwd, depth=1, **overrides):
+        # Bound the upward search so tests stay hermetic (no /tmp or / AGENTS.md).
+        blaster.AGENTS_MD_MAX_DEPTH = depth
+        agent = _make_agent(cwd=cwd, **overrides)
+        return agent, agent.messages[0].content
+
+    def test_injected_from_cwd(self):
+        (self.root / "AGENTS.md").write_text("Always use tabs.\n")
+        agent, sys_prompt = self._system(self.root)
+        self.assertEqual(agent.agents_md_path, self.root / "AGENTS.md")
+        self.assertIn("Always use tabs.", sys_prompt)
+        self.assertIn("AGENTS.md", sys_prompt)
+
+    def test_found_in_parent_dir(self):
+        (self.root / "AGENTS.md").write_text("Repo-wide rule.\n")
+        child = self.root / "sub"
+        child.mkdir()
+        agent, sys_prompt = self._system(child, depth=2)
+        self.assertEqual(agent.agents_md_path, self.root / "AGENTS.md")
+        self.assertIn("Repo-wide rule.", sys_prompt)
+
+    def test_absent_when_no_file(self):
+        agent, sys_prompt = self._system(self.root)
+        self.assertIsNone(agent.agents_md_path)
+        self.assertNotIn("AGENTS.md", sys_prompt)
+
+    def test_disabled_skips(self):
+        (self.root / "AGENTS.md").write_text("Should be ignored.\n")
+        agent, sys_prompt = self._system(self.root, agents_md_enabled=False)
+        self.assertIsNone(agent.agents_md_path)
+        self.assertNotIn("Should be ignored.", sys_prompt)
+
+    def test_explicit_file_overrides_discovery(self):
+        rules = self.root / "custom-rules.md"
+        rules.write_text("Custom rules here.\n")
+        other = self.root / "elsewhere"
+        other.mkdir()
+        (other / "AGENTS.md").write_text("Should not be used.\n")
+        agent, sys_prompt = self._system(other, agents_md_file=str(rules))
+        self.assertEqual(agent.agents_md_path, rules)
+        self.assertIn("Custom rules here.", sys_prompt)
+        self.assertNotIn("Should not be used.", sys_prompt)
+
+    def test_missing_explicit_file_ignored(self):
+        agent, sys_prompt = self._system(
+            self.root, agents_md_file=str(self.root / "nope.md"))
+        self.assertIsNone(agent.agents_md_path)
+        self.assertNotIn("AGENTS.md", sys_prompt)
+
+    def test_truncated_when_too_large(self):
+        (self.root / "AGENTS.md").write_text("x" * 5000)
+        _, sys_prompt = self._system(self.root, max_agents_md_chars=100)
+        self.assertIn("AGENTS.md truncated", sys_prompt)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

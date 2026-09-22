@@ -48,6 +48,18 @@ class Config:
     allow_edits: bool = False
     # True when running in single-shot -p mode (never prompts for edits).
     non_interactive: bool = False
+    # Load AGENTS.md into the system prompt. By default the nearest AGENTS.md
+    # from the working directory upward is used; --agents-md PATH overrides with
+    # a specific file, and --agents-md none disables (agents_md_enabled=False).
+    agents_md_enabled: bool = True
+    agents_md_file: Optional[str] = None
+    max_agents_md_chars: int = 20_000
+
+
+# Project instructions convention: an AGENTS.md file (looked up from the
+# working directory upward) whose contents are injected into the system prompt.
+AGENTS_MD_FILENAME = "AGENTS.md"
+AGENTS_MD_MAX_DEPTH = 10   # how far up from the cwd to look for AGENTS.md
 
 
 # Command patterns needing y/N approval (whole-word; harmless uses like
@@ -494,6 +506,19 @@ class BasicCodingAgent:
         self.conversation_summary = ""
         self.total_tokens_used = 0
         self.input_handler = EnhancedInput()
+        # Resolve AGENTS.md once; its contents are injected into the system
+        # prompt. --agents-md PATH uses a specific file, --agents-md none (or
+        # agents_md_enabled=False) disables, otherwise find the nearest one.
+        self.agents_md_path: Optional[Path] = None
+        if self.config.agents_md_enabled:
+            if self.config.agents_md_file:
+                candidate = Path(self.config.agents_md_file).expanduser()
+                if candidate.is_file():
+                    self.agents_md_path = candidate
+                else:
+                    print(f"⚠️  {_c('AGENTS.md file not found:', 'yellow')} {candidate}")
+            else:
+                self.agents_md_path = self._find_agents_md()
 
         # Sessions are identified by a unique id and a human-friendly name
         # describing the task. Load a session by name if one was given,
@@ -686,10 +711,43 @@ class BasicCodingAgent:
 
         return " | ".join(recent_exchanges[-3:])  # Last 3 exchanges
 
+    def _find_agents_md(self) -> Optional[Path]:
+        """Return the nearest AGENTS.md from the working directory upward."""
+        d = self.project_root
+        for _ in range(AGENTS_MD_MAX_DEPTH):
+            candidate = d / AGENTS_MD_FILENAME
+            try:
+                if candidate.is_file():
+                    return candidate
+            except OSError:
+                pass
+            if d.parent == d:
+                break
+            d = d.parent
+        return None
+
+    def _get_agents_md(self) -> str:
+        """Return AGENTS.md contents formatted for the system prompt, or ''."""
+        if not self.agents_md_path:
+            return ""
+        try:
+            text = self.agents_md_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            return ""
+        if not text:
+            return ""
+        if len(text) > self.config.max_agents_md_chars:
+            text = (text[:self.config.max_agents_md_chars].rstrip()
+                    + "\n\n... [AGENTS.md truncated]")
+        return (f"Project instructions from {self.agents_md_path} (AGENTS.md — "
+                f"follow these; they take precedence for this project):\n\n{text}")
+
     def _initialize_system_prompt(self):
         """Create system prompt with tool rules and session context"""
         project_info = self._get_project_info()
         session_info = self._get_session_info()
+        agents_md = self._get_agents_md()
+        agents_block = f"{agents_md}\n\n" if agents_md else ""
 
         system_prompt = f"""You are Blaster, a server operations and coding assistant running directly on this machine. You help set up, maintain, configure, and debug servers and code, and you execute actions via tools.
 
@@ -697,7 +755,7 @@ You operate in the working directory: {self.project_root}
 The current date is {datetime.now().strftime('%Y-%m-%d')}.
 Edit mode: {("ENABLED (-w/--write)" if self.config.allow_edits else "OFF — safe/read-only mode; write_file/edit_file are blocked unless the user approves")}.
 
-{project_info}
+{agents_block}{project_info}
 
 {session_info}
 
@@ -1594,6 +1652,8 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         if self.session_context:
             print(f"  {_c('Session:', 'cyan')} {self.session_context.name} "
                   f"({self.session_context.session_id}, auto-saved)")
+        if self.agents_md_path:
+            print(f"  {_c('Rules:', 'cyan')}    {self.agents_md_path} {_c('(AGENTS.md)', 'dim')}")
         print(_c("Type 'quit' to exit. Ctrl+C to interrupt.", "dim"))
         self._show_past_messages()
         print()
@@ -1753,6 +1813,9 @@ def main():
                              'files (safe/read-only by default)')
     parser.add_argument('-t', '--timeout', dest='request_timeout', type=int,
                         help='LLM request timeout in seconds (default: 300)')
+    parser.add_argument('--agents-md', dest='agents_md', metavar='PATH', default=None,
+                        help="AGENTS.md file to load ('none' disables; default: "
+                             "auto-discover from the working directory upward)")
     args = parser.parse_args()
 
     if args.session == '__list__':
@@ -1776,6 +1839,11 @@ def main():
     config.session_enabled = args.session_enabled
     config.allow_edits = args.allow_edits
     config.non_interactive = args.prompt is not None
+    if args.agents_md is not None:
+        if args.agents_md.strip().lower() == "none":
+            config.agents_md_enabled = False
+        else:
+            config.agents_md_file = args.agents_md
 
     # Create and run agent
     agent = BasicCodingAgent(config, args.session)

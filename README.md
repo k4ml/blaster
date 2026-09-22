@@ -21,6 +21,7 @@ It's optimized for **local models** (Ollama / llama.cpp): lightweight context, n
 - **Local-first**: defaults to `http://localhost:11434/v1` (Ollama) with no API key required
 - **Any OpenAI-compatible backend**: Ollama, llama.cpp, OpenRouter, OpenAI, vLLM, etc.
 - **Persistent sessions**: named conversations (e.g. `daring-horizon`) auto-saved and resumable across directories
+- **Project instructions (`AGENTS.md`)**: the nearest `AGENTS.md` from the working directory upward is injected into the system prompt; `--agents-md PATH` overrides with a specific file and `--agents-md none` disables it
 - **Non-interactive mode**: `-p "prompt"` runs a single prompt and exits — scriptable from cron, CI, or other tools
 - **Markdown rendering**: non-interactive answers are rendered with `glow` when it's installed and stdout is a TTY (`-x`/`--no-format` disables)
 - **Live "thinking" indicator**: responses are streamed (`stream: true`), so long generations don't time out the connection. A spinner animates during prefill, then for reasoning models (qwen3, etc.) the reasoning streams via `delta.reasoning` and is shown as a collapsed `Thinking ... (N lines) [Ctrl+O to expand]` line that updates live — press Ctrl+O to expand it inline. The answer streams inline after. (All this is TTY-only; when piped, reasoning stays silent and the answer streams plain text.)
@@ -106,6 +107,7 @@ python blaster.py -w -p "add a docstring to utils.py and fix the typo in config.
 | `--session` | auto (random name) | Session name to load/resume; bare `--session` lists sessions |
 | `-x`/`--no-format` | off | Disable `glow` markdown rendering in non-interactive mode |
 | `-s`/`--no-session` | off | Disable sessions entirely (no load, create, or save) |
+| `--agents-md` | auto-discover | `AGENTS.md` file to load (`--agents-md PATH` for a specific file, `--agents-md none` to disable) |
 
 ### Environment variables
 
@@ -169,6 +171,9 @@ class Config:
     session_enabled: bool = True    # -s/--no-session disables all session I/O
     allow_edits: bool = False      # -w/--write enables write_file/edit_file
     non_interactive: bool = False  # set in -p mode; never prompts for edits
+    agents_md_enabled: bool = True        # --agents-md none disables AGENTS.md
+    agents_md_file: Optional[str] = None  # --agents-md PATH overrides discovery
+    max_agents_md_chars: int = 20_000     # cap on AGENTS.md text injected
 ```
 
 ### Edit mode (safe by default)
@@ -194,6 +199,14 @@ Commands are checked against `DESTRUCTIVE_PATTERNS` (whole-word, so harmless use
 
 A declined command is remembered for the session so the model cannot silently retry it.
 
+### Project instructions (`AGENTS.md`)
+
+On startup Blaster looks for an `AGENTS.md` file — the convention for project-level agent instructions — starting from the working directory and walking up its parents (bounded to 10 levels). The nearest one found is injected into the system prompt under a clear heading, so the model follows your project's coding standards, commands, and conventions. The startup banner shows `Rules: …/AGENTS.md` when one is loaded.
+
+- Size is capped at `max_agents_md_chars` (default 20 KB); larger files are truncated with a marker.
+- `--agents-md PATH` loads a specific file instead of discovering one (handy for shared/standard rule files); a missing path warns and loads nothing.
+- `--agents-md none` disables loading entirely — useful when you run Blaster on a host where you don't want a repo-controlled file steering the agent.
+
 ## Sessions
 
 Conversations auto-save after every turn to `~/.blaster/sessions/<session_id>.json`. Each session gets a unique id (the filename) and a human-friendly name — auto-generated as an adjective-noun pair (e.g. `daring-horizon`) unless you pass `--session NAME`. Sessions identify tasks, not directories: `--session` matches by name across every saved session, so you can resume one from any working directory. Bare `python blaster.py --session` lists saved sessions (name, id, message count, created/last-used). On resume the last 100 messages are restored and shown as a recap, and the per-turn context window is capped at 100 messages to protect the model's context. Use `-s`/`--no-session` to skip all session loading and saving.
@@ -206,8 +219,8 @@ The file is organized as:
 2. **Dataclasses** — `Message`, `ToolCall`, `LLMResponse`, `SessionContext`, `BashToolResult`
 3. **`EnhancedInput` / `_Spinner` / `_ThinkingPanel`** — raw-mode line editor (history, cursor keys, Ctrl+A/E/U) with plain `input()` fallback when piped; a prefill spinner; and a collapsed reasoning panel (`Thinking ... (N lines) [Ctrl+O to expand]`, TTY-only)
 4. **`_TOOL_SPECS` / `_get_tools()`** — the tool schemas advertised to the model; add a tool by appending one tuple
-5. **`BasicCodingAgent`** — orchestration: session load/save, system prompt, streaming LLM calls (`stream: true`, with live reasoning/answer output via `_read_stream`), message trimming, the tool-execution loop (with a configurable round guard, default 50), and the file/shell tool implementations
-6. **`main()`** — CLI parsing (`--model`, `--api-base`, `--cwd`, `--session`, `-p`, `-n`, `-t`, `-w`, `-x`, `-s`), interactive loop, and non-interactive single-prompt mode
+5. **`BasicCodingAgent`** — orchestration: session load/save, `AGENTS.md` discovery + system-prompt assembly, streaming LLM calls (`stream: true`, with live reasoning/answer output via `_read_stream`), message trimming, the tool-execution loop (with a configurable round guard, default 50), and the file/shell tool implementations
+6. **`main()`** — CLI parsing (`--model`, `--api-base`, `--cwd`, `--session`, `-p`, `-n`, `-t`, `-w`, `-x`, `-s`, `--agents-md`), interactive loop, and non-interactive single-prompt mode
 
 ### Data flow
 
@@ -258,7 +271,7 @@ Run the stdlib-only suite (spins up in-process mock LLM servers, no network):
 python tests.py
 ```
 
-It covers the safe-by-default edit gate, streamed responses (including the short-timeout case), the live reasoning panel, and HTTP parsing/fallbacks. Exits non-zero on failure, so it's CI-friendly.
+It covers the safe-by-default edit gate, streamed responses (including the short-timeout case), the live reasoning panel, `AGENTS.md` discovery/injection, and HTTP parsing/fallbacks. Exits non-zero on failure, so it's CI-friendly.
 
 ## License
 
