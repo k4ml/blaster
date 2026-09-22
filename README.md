@@ -244,11 +244,21 @@ Sessions are matched by name across all saved sessions (not tied to a directory)
 
 ## Development
 
-The project deliberately stays a single stdlib-only file. To extend it:
+The project deliberately stays stdlib-only (blaster itself is a single file; `tests.py` is separate). To extend it:
 
 1. **Add a tool**: append a `(name, description, props, required)` tuple to `_TOOL_SPECS`, add an `elif` branch in `_execute_tool`, and implement the handler method.
 2. **Tune safety**: edit `DESTRUCTIVE_PATTERNS` / `SUDO_PATTERN`.
 3. **Change behavior**: adjust the system prompt in `_initialize_system_prompt` or the `Config` defaults.
+
+### Tests
+
+Run the stdlib-only suite (spins up in-process mock LLM servers, no network):
+
+```bash
+python tests.py
+```
+
+It covers the safe-by-default edit gate, streamed responses (including the short-timeout case), the live reasoning panel, and HTTP parsing/fallbacks. Exits non-zero on failure, so it's CI-friendly.
 
 ## License
 
