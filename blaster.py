@@ -6,11 +6,13 @@ done on the host it runs on. Uses an OpenAI-compatible chat endpoint
 (Ollama/llama.cpp/OpenRouter/...) as a natural-language shell: inspect/edit
 files, run shell commands, configure and maintain services. Tools:
 read_file, write_file, edit_file, list_files, run_shell, run_interactive.
-Destructive or sudo commands require y/N approval.
+Destructive or sudo commands require y/N approval. By default file edits
+(write_file/edit_file) are blocked for production safety; -w/--write enables
+edit mode, and an interactive terminal can approve a single edit on the spot.
 
 Usage:
     python blaster.py [--model qwen3.8:27b] [--api-base http://localhost:11434/v1]
-                      [--cwd DIR] [--session NAME] [-s] [-n MAX_ITERATION]
+                      [--cwd DIR] [--session NAME] [-w] [-s] [-n MAX_ITERATION]
 Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (optional; only sent when set)
 """
 import argparse, difflib, json, os, random, re, shutil, subprocess, sys, termios, tty, urllib.error, urllib.request, uuid
@@ -40,6 +42,12 @@ class Config:
     format_markdown: bool = True
     # Persist sessions to disk; -s/--no-session disables (no load/create/save).
     session_enabled: bool = True
+    # Safe by default for production: write_file/edit_file are blocked unless
+    # the user enables edit mode with -w/--write. On a real terminal a single
+    # edit can be approved on the spot; non-interactive/non-TTY runs are blocked.
+    allow_edits: bool = False
+    # True when running in single-shot -p mode (never prompts for edits).
+    non_interactive: bool = False
 
 
 # Command patterns needing y/N approval (whole-word; harmless uses like
@@ -272,10 +280,10 @@ def _render_markdown(text: str) -> None:
 _TOOL_SPECS = [
     ("read_file", "Read a file's content. Use when the user asks about a file, config, log, or file content.",
      {"path": ("string", "File path, absolute or relative to cwd")}, ["path"]),
-    ("write_file", "Create a new file or overwrite an existing one.",
+    ("write_file", "Create a new file or overwrite an existing one. Blocked unless edit mode is enabled (-w/--write); in an interactive terminal a single write may be approved on the spot.",
      {"path": ("string", "File path, absolute or relative to cwd"),
       "content": ("string", "Full new content of the file")}, ["path", "content"]),
-    ("edit_file", "Edit an existing file by replacing a unique substring (before) with new text (after). A .bak backup is made.",
+    ("edit_file", "Edit an existing file by replacing a unique substring (before) with new text (after). A .bak backup is made. Blocked unless edit mode is enabled (-w/--write); in an interactive terminal a single edit may be approved on the spot.",
      {"path": ("string", "File path, absolute or relative to cwd"),
       "before": ("string", "Exact existing text to find (must be unique)"),
       "after": ("string", "Replacement text")}, ["path", "before", "after"]),
@@ -526,6 +534,7 @@ class BasicCodingAgent:
 
 You operate in the working directory: {self.project_root}
 The current date is {datetime.now().strftime('%Y-%m-%d')}.
+Edit mode: {("ENABLED (-w/--write)" if self.config.allow_edits else "OFF — safe/read-only mode; write_file/edit_file are blocked unless the user approves")}.
 
 {project_info}
 
@@ -533,6 +542,7 @@ The current date is {datetime.now().strftime('%Y-%m-%d')}.
 
 TOOL USE RULES (critical):
 - Prefer using tools over merely describing what to do. You can actually change the system.
+- FILE EDITS: when edit mode is OFF, write_file and edit_file are blocked. If you need to change a file, ask the user to enable edit mode (or approve the edit) and stop — do NOT retry the edit, and do NOT work around the block with shell redirections (sed -i, echo >, tee, etc.). When edit mode is ON, edits proceed with a .bak backup.
 - Before reading or editing a file, run_shell 'ls' / read_file to see what exists. If an edit_file 'before' string is rejected, read the file to get exact content.
 - run_shell output is returned to you verbatim (capped). Use exit codes to judge success. For long-running commands pass a generous timeout.
 - When a command fails, inspect the error and try to fix it yourself (check logs, configs, dependencies) before giving up.
@@ -871,9 +881,58 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
 
         return f"--- {file_path} ---\n{content}\n--- end {file_path} ---"
 
+    def _gate_edit(self, file_path: str, action: str) -> str:
+        """Return an empty string to allow an edit, or a block/reason message.
+
+        Safe by default: when edit mode is off (no -w/--write), file-modifying
+        tools are blocked. On a real terminal the user can approve a single
+        edit on the spot; non-interactive/non-TTY runs are hard-blocked so a
+        scripted or cron invocation cannot change files without --write.
+        """
+        if self.config.allow_edits:
+            return ""
+        # Non-interactive (-p) or piped stdin: never prompt, just block.
+        if self.config.non_interactive or not sys.stdin.isatty():
+            return ("[edit blocked: edit mode is off. Re-run with -w/--write "
+                    "to allow file edits. Tell the user and do not retry.]")
+        # Interactive terminal: ask the user to approve this single edit.
+        try:
+            sys.stdout.write(
+                f"\n🔒 Edit mode is off (-w/--write to enable permanently). "
+                f"{action}: {file_path}\nAllow this edit? [y/N] ")
+            sys.stdout.flush()
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                answer = ""
+                while True:
+                    ch = sys.stdin.read(1)
+                    if ch in ("\r", "\n"):
+                        break
+                    if ch in ("y", "Y", "n", "N"):
+                        answer = ch
+                        break
+                    if ch == "\x03":
+                        raise KeyboardInterrupt
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            if answer.lower() == "y":
+                return ""
+            return (f"[edit declined by user: {action} {file_path}. "
+                    f"Do not retry; tell the user.]")
+        except KeyboardInterrupt:
+            sys.stdout.write("\n[interrupted]\n")
+            return f"[edit interrupted: {action} {file_path}]"
+
     def _write_file(self, path: str, content: str) -> str:
         """Write content to file, creating a .bak backup if the file exists"""
         file_path = self._resolve_path(path)
+        gate = self._gate_edit(str(file_path), "write_file")
+        if gate:
+            return gate
 
         # Create backup if the file already exists
         backup_path = file_path.with_suffix(file_path.suffix + '.bak')
@@ -898,6 +957,9 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
     def _edit_file(self, path: str, before: str, after: str) -> str:
         """Edit a file by replacing a unique substring."""
         file_path = self._resolve_path(path)
+        gate = self._gate_edit(str(file_path), "edit_file")
+        if gate:
+            return gate
         if not file_path.exists():
             return f"Error: File not found: {file_path}"
         if file_path.is_dir():
@@ -1252,6 +1314,10 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
         print(f"  {_c('Project:', 'cyan')} {self.project_root}")
         print(f"  {_c('Model:', 'cyan')}   {self.config.model}")
         print(f"  {_c('API:', 'cyan')}     {self.config.api_base}")
+        if self.config.allow_edits:
+            print(f"  {_c('Edits:', 'cyan')}   enabled {_c('(--write)', 'dim')}")
+        else:
+            print(f"  {_c('Edits:', 'cyan')}   {_c('off — safe mode (use -w/--write to enable)', 'yellow')}")
         if self.session_context:
             print(f"  {_c('Session:', 'cyan')} {self.session_context.name} "
                   f"({self.session_context.session_id}, auto-saved)")
@@ -1408,6 +1474,9 @@ def main():
     parser.add_argument('-s', '--no-session', dest='session_enabled',
                         action='store_false',
                         help='Disable sessions: do not load, create, or save any session')
+    parser.add_argument('-w', '--write', dest='allow_edits', action='store_true',
+                        help='Enable edit mode: allow write_file/edit_file to modify '
+                             'files (safe/read-only by default)')
     args = parser.parse_args()
 
     if args.session == '__list__':
@@ -1427,6 +1496,8 @@ def main():
         config.max_iterations = args.max_iterations
     config.format_markdown = args.format_markdown
     config.session_enabled = args.session_enabled
+    config.allow_edits = args.allow_edits
+    config.non_interactive = args.prompt is not None
 
     # Create and run agent
     agent = BasicCodingAgent(config, args.session)

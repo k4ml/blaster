@@ -16,6 +16,7 @@ It's optimized for **local models** (Ollama / llama.cpp): lightweight context, n
 
 - **Server ops**: run shell commands, check `systemctl`/`docker`/processes, tail logs, install packages, manage services
 - **Coding**: read, write, and edit files with automatic `.bak` backups
+- **Safe by default**: file edits (`write_file`/`edit_file`) are blocked unless edit mode is enabled with `-w`/`--write`; on an interactive terminal a single edit can be approved on the spot, while scripted/non-interactive runs are hard-blocked
 - **Safety prompts**: destructive commands (`rm -rf`, `mkfs`, `dd`, ...) and anything using `sudo` ask for y/N approval before running; declined commands stay blocked for the session
 - **Local-first**: defaults to `http://localhost:11434/v1` (Ollama) with no API key required
 - **Any OpenAI-compatible backend**: Ollama, llama.cpp, OpenRouter, OpenAI, vLLM, etc.
@@ -84,6 +85,10 @@ python blaster.py -p "check disk usage and report the top 5 largest dirs"
 # Disable markdown rendering / sessions
 python blaster.py -p "..." -x
 python blaster.py -s
+
+# Enable edit mode (otherwise write_file/edit_file are blocked)
+python blaster.py -w
+python blaster.py -w -p "add a docstring to utils.py and fix the typo in config.py"
 ```
 
 ### Command-line options
@@ -95,6 +100,7 @@ python blaster.py -s
 | `--cwd` | current directory | Working directory for all tools |
 | `-p`/`--prompt` | — | Non-interactive mode: run a single prompt and exit |
 | `-n`/`--max-iteration` | 50 | Max tool rounds per turn (safety limit to prevent loops) |
+| `-w`/`--write` | off | Enable edit mode: allow `write_file`/`edit_file` to modify files (blocked by default for safety) |
 | `--session` | auto (random name) | Session name to load/resume; bare `--session` lists sessions |
 | `-x`/`--no-format` | off | Disable `glow` markdown rendering in non-interactive mode |
 | `-s`/`--no-session` | off | Disable sessions entirely (no load, create, or save) |
@@ -159,7 +165,19 @@ class Config:
     cwd: Path = Path.cwd()
     format_markdown: bool = True    # render non-interactive answers with glow
     session_enabled: bool = True    # -s/--no-session disables all session I/O
+    allow_edits: bool = False      # -w/--write enables write_file/edit_file
+    non_interactive: bool = False  # set in -p mode; never prompts for edits
 ```
+
+### Edit mode (safe by default)
+
+Blaster is meant to run on production servers, so it does **not** modify files unless you opt in. By default `write_file` and `edit_file` are blocked:
+
+- **`-w`/`--write`** enables edit mode for the whole run — edits proceed (with `.bak` backups), no prompts. Use this for scripted or unattended work that needs to change files.
+- **Without `--write`, on an interactive terminal**, each attempted edit prompts `Allow this edit? [y/N]` so you can approve a one-off change without restarting.
+- **Without `--write`, in non-interactive/non-TTY runs** (e.g. `-p` from cron/CI, or piped input), edits are **hard-blocked** — a scripted invocation cannot change files unless `--write` is passed. The agent is told the edit was blocked and should report this back rather than retry or work around it with shell redirections (`sed -i`, `echo >`, `tee`).
+
+`run_shell` destructive/sudo commands keep their own y/N approval regardless of edit mode.
 
 ### Safety rules
 
@@ -187,7 +205,7 @@ The file is organized as:
 3. **`EnhancedInput`** — raw-mode line editor (history, cursor keys, Ctrl+A/E/U), plain `input()` fallback when stdin isn't a TTY
 4. **`_TOOL_SPECS` / `_get_tools()`** — the tool schemas advertised to the model; add a tool by appending one tuple
 5. **`BasicCodingAgent`** — orchestration: session load/save, system prompt, LLM calls (JSON or streaming NDJSON), message trimming, the tool-execution loop (with a configurable round guard, default 50), and the file/shell tool implementations
-6. **`main()`** — CLI parsing (`--model`, `--api-base`, `--cwd`, `--session`, `-p`, `-n`, `-x`, `-s`), interactive loop, and non-interactive single-prompt mode
+6. **`main()`** — CLI parsing (`--model`, `--api-base`, `--cwd`, `--session`, `-p`, `-n`, `-w`, `-x`, `-s`), interactive loop, and non-interactive single-prompt mode
 
 ### Data flow
 
