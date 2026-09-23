@@ -26,7 +26,7 @@ It's optimized for **local models** (Ollama / llama.cpp): lightweight context, n
 - **Markdown rendering**: non-interactive answers are rendered with `glow` when it's installed and stdout is a TTY (`-x`/`--no-format` disables)
 - **Live "thinking" indicator**: responses are streamed (`stream: true`), so long generations don't time out the connection. A spinner animates during prefill, then for reasoning models (qwen3, etc.) the reasoning streams via `delta.reasoning` and is shown as a collapsed `Thinking ... (N lines) [Ctrl+O to expand]` line that updates live — press Ctrl+O to expand it inline. The answer streams inline after. (All this is TTY-only; when piped, reasoning stays silent and the answer streams plain text.)
 - **Live feedback**: `run_shell` shows the exact command before it runs, `edit_file` shows a colored diff of what changes
-- **Enhanced terminal**: arrow-key history, cursor movement, Ctrl+A/E/U shortcuts (falls back to plain `input()` when piped)
+- **Enhanced terminal**: arrow-key history, cursor movement, Ctrl+A/E/U shortcuts, and multiline paste — a pasted block (bracketed paste, or a burst of input) becomes one message; falls back to plain `input()` when piped
 
 ## Tools
 
@@ -217,7 +217,7 @@ The file is organized as:
 
 1. **`Config` + safety patterns** — endpoint/model defaults and the approval regexes
 2. **Dataclasses** — `Message`, `ToolCall`, `LLMResponse`, `SessionContext`, `BashToolResult`
-3. **`EnhancedInput` / `_Spinner` / `_ThinkingPanel`** — raw-mode line editor (history, cursor keys, Ctrl+A/E/U) with plain `input()` fallback when piped; a prefill spinner; and a collapsed reasoning panel (`Thinking ... (N lines) [Ctrl+O to expand]`, TTY-only)
+3. **`EnhancedInput` / `_Spinner` / `_ThinkingPanel`** — cbreak line editor (history, cursor keys, Ctrl+A/E/U, multiline paste) that repaints by tracking the cursor's screen row (wrapped lines counted), with plain `input()` fallback when piped; a prefill spinner; and a collapsed reasoning panel (`Thinking ... (N lines) [Ctrl+O to expand]`, TTY-only)
 4. **`_TOOL_SPECS` / `_get_tools()`** — the tool schemas advertised to the model; add a tool by appending one tuple
 5. **`BasicCodingAgent`** — orchestration: session load/save, `AGENTS.md` discovery + system-prompt assembly, streaming LLM calls (`stream: true`, with live reasoning/answer output via `_read_stream`), message trimming, the tool-execution loop (with a configurable round guard, default 50), and the file/shell tool implementations
 6. **`main()`** — CLI parsing (`--model`, `--api-base`, `--cwd`, `--session`, `-p`, `-n`, `-t`, `-w`, `-x`, `-s`, `--agents-md`), interactive loop, and non-interactive single-prompt mode
@@ -271,7 +271,7 @@ Run the stdlib-only suite (spins up in-process mock LLM servers, no network):
 python tests.py
 ```
 
-It covers the safe-by-default edit gate, streamed responses (including the short-timeout case), the live reasoning panel, `AGENTS.md` discovery/injection, and HTTP parsing/fallbacks. Exits non-zero on failure, so it's CI-friendly.
+It covers the safe-by-default edit gate, streamed responses (including the short-timeout case), the live reasoning panel, `AGENTS.md` discovery/injection, the multiline input redraw (including wrapped lines), and HTTP parsing/fallbacks. Exits non-zero on failure, so it's CI-friendly.
 
 ## License
 

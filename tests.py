@@ -9,6 +9,7 @@ import contextlib
 import http.server
 import io
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -356,6 +357,77 @@ class TestAgentsMd(unittest.TestCase):
         (self.root / "AGENTS.md").write_text("x" * 5000)
         _, sys_prompt = self._system(self.root, max_agents_md_chars=100)
         self.assertIn("AGENTS.md truncated", sys_prompt)
+
+
+# ---------------------------------------------------------------------------
+# Multiline input editor (redraw)
+# ---------------------------------------------------------------------------
+class TestEnhancedInputRedraw(unittest.TestCase):
+    def _redraw(self, line, pos, cur_row, prev_rows, prompt=">> ", width=None):
+        old_cols = os.environ.get("COLUMNS")
+        if width is not None:
+            os.environ["COLUMNS"] = str(width)
+        try:
+            with captured_io(color=False) as buf:
+                ei = blaster.EnhancedInput()
+                ei._prompt = prompt
+                ei.line, ei.pos = line, pos
+                ei._cur_row, ei._prev_rows = cur_row, prev_rows
+                ei._redraw()
+        finally:
+            if old_cols is None:
+                os.environ.pop("COLUMNS", None)
+            else:
+                os.environ["COLUMNS"] = old_cols
+        return buf.getvalue(), ei
+
+    def test_cursor_on_first_row_does_not_move_up(self):
+        # Multiline buffer, cursor at the very top: redraw must NOT move up.
+        # (The old code moved up prev_rows-1 from the cursor and smeared the
+        # block above — the reported "partial text repeated below" bug.)
+        out, ei = self._redraw("ab\ncd\nef", 0, 0, 3)
+        self.assertFalse(out.startswith("\x1b["), out)
+        self.assertEqual(ei._cur_row, 0)
+        self.assertEqual(ei._prev_rows, 3)
+        self.assertIn(">> ab", out)
+        self.assertIn(">> ef", out)
+
+    def test_cursor_on_middle_row_moves_up_by_that_row(self):
+        # pos sits in "cd" (row 1), so redraw moves up exactly 1 row to reach top.
+        out, ei = self._redraw("ab\ncd\nef", 4, 1, 3)
+        self.assertTrue(out.startswith("\x1b[1A"), out)
+        self.assertIn(">> cd", out)
+        self.assertEqual(ei._cur_row, 1)
+
+    def test_shrink_clears_leftover_rows(self):
+        # Was 3 rows, now 1 (e.g. Ctrl+U): the two stale rows must be cleared.
+        out, ei = self._redraw("x", 1, 2, 3)
+        self.assertEqual(out.count("\r\n\x1b[K"), 2, out)
+        self.assertEqual(ei._prev_rows, 1)
+        self.assertEqual(ei._cur_row, 0)
+
+    def test_wrapped_line_counts_extra_rows(self):
+        # Width 10, line 16 chars + ">> " = 19 cols -> 2 screen rows; the end
+        # cursor is on the 2nd row. Row tracking must account for the wrap.
+        line = "abcdefghijklmnop"
+        out, ei = self._redraw(line, len(line), 0, 1, width=10)
+        self.assertEqual(ei._prev_rows, 2)
+        self.assertEqual(ei._cur_row, 1)
+
+    def test_moves_up_across_wrapped_lines(self):
+        # Row 0 wraps to 2 screen rows, so a cursor on the 2nd logical line
+        # (screen row 2) must move up 2 rows to reach the top.
+        line = "aaaaaaaaaa\nb"
+        out, ei = self._redraw(line, len(line), 2, 3, width=10)
+        self.assertTrue(out.startswith("\x1b[2A"), out)
+        self.assertEqual(ei._cur_row, 2)
+
+    def test_non_tty_readline_reads_a_line(self):
+        with captured_io(color=False):
+            ei = blaster.EnhancedInput()
+            sys.stdin = io.StringIO("hello world\n")
+            line = ei.readline()
+        self.assertEqual(line, "hello world")
 
 
 if __name__ == "__main__":

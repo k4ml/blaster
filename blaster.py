@@ -15,7 +15,7 @@ Usage:
                       [--cwd DIR] [--session NAME] [-w] [-s] [-n MAX_ITERATION]
 Env: BLASTER_MODEL / BLASTER_API_BASE / OPENAI_API_KEY (optional; only sent when set)
 """
-import argparse, difflib, itertools, json, os, random, re, select, shutil, subprocess, sys, termios, threading, time, tty, urllib.error, urllib.request, uuid
+import argparse, atexit, difflib, fcntl, itertools, json, os, random, re, select, shutil, subprocess, sys, termios, threading, time, tty, urllib.error, urllib.request, uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -125,8 +125,21 @@ class BashToolResult:
         return "\n".join(parts)
 
 
+def _term_width() -> int:
+    """Terminal width in columns (COLUMNS overrides; fallback 80)."""
+    try:
+        return max(4, shutil.get_terminal_size((80, 24)).columns)
+    except Exception:
+        return 80
+
+
 class EnhancedInput:
-    """Raw-mode line editor with history (arrow keys, backspace, Ctrl+A/E/U)."""
+    """Raw-mode line editor with history (arrow keys, backspace, Ctrl+A/E/U).
+
+    Supports multiline input: pasted text (bracketed paste, or a burst of
+    characters) inserts newlines into the buffer instead of submitting, so a
+    pasted block is sent as a single message.
+    """
 
     def __init__(self):
         self.history: List[str] = []
@@ -134,22 +147,119 @@ class EnhancedInput:
         self.line = ""
         self.pos = 0
         self._saved = ""
+        self._prev_rows = 1    # screen rows the buffer occupies (wrapped lines counted)
+        self._cur_row = 0      # which of those rows the cursor sits on right now
+        self._prompt = ">> "   # prompt drawn at the start of each buffer row
+        self._buf = b""
+        # Ask the terminal to wrap pastes in ESC[200~ ... ESC[201~ so we can
+        # tell a paste apart from typed Enter. Restored on exit.
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            sys.stdout.write("\x1b[?2004h")
+            sys.stdout.flush()
+            atexit.register(lambda: sys.stdout.write("\x1b[?2004l"))
 
     # --- line editing ---------------------------------------------------
     def _redraw(self):
-        # Repaint prompt+line and park the cursor at `pos`.
-        sys.stdout.write("\r\x1b[K>> " + self.line + "\r>> " + self.line[:self.pos])
+        # Repaint the (possibly multiline) buffer and park the cursor at `pos`.
+        # Screen rows are counted per *wrapped* line (a logical line wider than
+        # the terminal spans several rows), and we move up from the cursor's
+        # actual row — assuming it was on the last row smears partial copies
+        # once it moves earlier or a line wraps.
+        prompt = self._prompt
+        plen = len(prompt)
+        width = _term_width()
+        lines = self.line.split("\n")
+        before = self.line[:self.pos]
+        cur_line = before.count("\n")
+        cur_col = len(before) - (before.rfind("\n") + 1)
+
+        def rows_of(text):  # screen rows a single logical line occupies
+            return max(1, (plen + len(text) + width - 1) // width)
+
+        total_rows = sum(rows_of(ln) for ln in lines)
+        d = plen + cur_col
+        cur_row = sum(rows_of(lines[i]) for i in range(cur_line)) + d // width
+        cur_vis_col = d % width
+        if d and d % width == 0:      # cursor parked exactly on a wrap boundary
+            cur_row -= 1
+            cur_vis_col = width - 1
+
+        # 1. Jump from the cursor's current row to the top-left of the block.
+        if self._cur_row:
+            sys.stdout.write(f"\x1b[{self._cur_row}A")
+        sys.stdout.write("\r")
+        # 2. Repaint each logical line (CR+LF advances rows; long lines wrap).
+        for i, ln in enumerate(lines):
+            if i:
+                sys.stdout.write("\r\n")
+            sys.stdout.write("\x1b[K" + prompt + ln)
+        # 3. Blank rows left over from a taller previous block (e.g. Ctrl+U).
+        extra = self._prev_rows - total_rows
+        for _ in range(max(0, extra)):
+            sys.stdout.write("\r\n\x1b[K")
+        # 4. Walk the cursor from the last painted row back to its row/col.
+        rows_below = max(total_rows, self._prev_rows) - 1 - cur_row
+        if rows_below > 0:
+            sys.stdout.write(f"\x1b[{rows_below}A")
+        sys.stdout.write("\r")
+        if cur_vis_col:
+            sys.stdout.write(f"\x1b[{cur_vis_col}C")
+        self._prev_rows = total_rows
+        self._cur_row = cur_row
         sys.stdout.flush()
 
-    def _key(self) -> str:
+    def _paste(self):
+        """Insert a bracketed-paste payload (up to the ESC[201~ end marker)."""
+        while True:
+            ch = self._key()
+            if ch == "\x1b":
+                tail = (self._key() + self._key() + self._key()
+                        + self._key() + self._key())
+                if tail == "[201~":
+                    break
+                self._insert("\x1b" + tail)
+                continue
+            self._insert(ch)
+
+    def _fill(self):
+        """Pull any available raw bytes from the fd into self._buf (non-blocking).
+
+        Reading the fd directly (not sys.stdin) keeps pasted bursts in one
+        place we can inspect; Python's text-buffered stdin would swallow the
+        burst and hide it from select().
+        """
         fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
         try:
-            tty.setraw(fd)
-            ch = sys.stdin.read(1)
+            chunk = os.read(fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            chunk = b""
+        except OSError:
+            chunk = b""
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        return ch
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+        if chunk:
+            self._buf += chunk
+
+    def _key(self) -> str:
+        """Return the next input character (blocking until one is available).
+
+        Decodes full UTF-8 sequences so multibyte input (emoji, unicode) is
+        not mangled by byte-at-a-time reads.
+        """
+        while True:
+            try:
+                s = self._buf.decode("utf-8")
+            except UnicodeDecodeError:
+                s = ""
+            if s:
+                ch = s[0]
+                self._buf = self._buf[len(ch.encode("utf-8")):]
+                return ch
+            r, _, _ = select.select([sys.stdin], [], [], None)
+            if r:
+                self._fill()
 
     def _insert(self, ch: str):
         self.line = self.line[:self.pos] + ch + self.line[self.pos:]
@@ -190,13 +300,43 @@ class EnhancedInput:
                 self.history.append(line)
             return line
 
+        # TTY path: cbreak so single keystrokes arrive immediately (no echo, no
+        # line buffering) while Ctrl+C still raises SIGINT. Restored afterwards.
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            return self._readline_tty(prompt)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def _readline_tty(self, prompt: str) -> str:
+        self._prompt = prompt
         sys.stdout.write(prompt)
         sys.stdout.flush()
         self.line, self.pos, self.hist_i = "", 0, 0
+        self._prev_rows = 1
+        self._cur_row = 0
+        self._buf = b""
         while True:
             try:
                 ch = self._key()
                 if ch in ("\r", "\n"):
+                    # A burst of more input right after Enter means a paste on
+                    # a terminal without bracketed paste: keep it in the buffer
+                    # instead of submitting.
+                    if self._buf:
+                        self._insert("\n")
+                        continue
+                    r, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if r:
+                        self._fill()
+                        self._insert("\n")
+                        continue
+                    # Drop below the whole block so output that follows doesn't
+                    # overwrite it (the cursor may be on an earlier row).
+                    if self._cur_row < self._prev_rows - 1:
+                        sys.stdout.write(f"\x1b[{self._prev_rows - 1 - self._cur_row}B")
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     line = self.line.strip()
@@ -217,17 +357,22 @@ class EnhancedInput:
                     self.pos = len(self.line)
                     self._redraw()
                 elif ch == "\x1b":                 # escape sequence
-                    seq = self._key() + self._key()
-                    if seq == "[A":
-                        self._hist(-1)
-                    elif seq == "[B":
-                        self._hist(1)
-                    elif seq == "[C" and self.pos < len(self.line):
-                        self.pos += 1
-                        self._redraw()
-                    elif seq == "[D" and self.pos > 0:
-                        self.pos -= 1
-                        self._redraw()
+                    c = self._key()
+                    if c == "[":
+                        c2 = self._key()
+                        if c2 == "2":
+                            self._key(); self._key(); self._key()  # "00~"
+                            self._paste()
+                        elif c2 == "A":
+                            self._hist(-1)
+                        elif c2 == "B":
+                            self._hist(1)
+                        elif c2 == "C" and self.pos < len(self.line):
+                            self.pos += 1
+                            self._redraw()
+                        elif c2 == "D" and self.pos > 0:
+                            self.pos -= 1
+                            self._redraw()
                 elif ch >= " ":
                     self._insert(ch)
             except KeyboardInterrupt:
@@ -1654,7 +1799,7 @@ read_file, write_file, edit_file, list_files, run_shell, run_interactive
                   f"({self.session_context.session_id}, auto-saved)")
         if self.agents_md_path:
             print(f"  {_c('Rules:', 'cyan')}    {self.agents_md_path} {_c('(AGENTS.md)', 'dim')}")
-        print(_c("Type 'quit' to exit. Ctrl+C to interrupt.", "dim"))
+        print(_c("Type 'quit' to exit. Ctrl+C to interrupt. Paste multiline text to send it as one message.", "dim"))
         self._show_past_messages()
         print()
 
