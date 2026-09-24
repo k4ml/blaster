@@ -16,11 +16,14 @@ Design notes (vs the old in-core CursesRenderer):
       2000-row pad that raised curses.error once it filled
     - real scrollback: PgUp/PgDn scroll by a page, Shift+Up/Down by a row,
       Home/End jump to the oldest line and back to the tail, and the mouse
-      wheel scrolls a few rows. Scrolling up detaches from the tail so
-      incoming output does not move the text you are reading; End (or PgDn
-      past the bottom) re-attaches
-    - mouse wheel reporting is enabled, so drag-select to copy text needs
-      Shift held down (the usual terminal convention for this tradeoff)
+      wheel scrolls a few rows when WHEELJACK_MOUSE=1 is set. Scrolling up
+      detaches from the tail so incoming output does not move the text you
+      are reading; End (or PgDn past the bottom) re-attaches
+    - mouse-wheel reporting is OFF by default and opt-in via WHEELJACK_MOUSE=1.
+      Turning it on makes the terminal deliver clicks and drags to this app
+      instead of doing its own selection, which silently breaks drag-to-select
+      for copy - the normal way to copy text out of an SSH session. Selection
+      is the thing that must always work, so it wins by default
     - redraw only when dirty, not every 50 ms unconditionally
     - keypad(True) + get_wch() so arrows/unicode/KEY_RESIZE work
     - a real line editor in the input box (history, cursor movement)
@@ -176,13 +179,21 @@ class TuiRenderer(core.BaseRenderer):
     def loop(self, app) -> None:
         self.curses.wrapper(self._run, app)
 
-    def _run(self, stdscr, app) -> None:
+    def _mouse_enabled(self) -> bool:
+        """Mouse reporting is opt-in.
+
+        It must default to off: enabling it makes the terminal route clicks
+        and drags to this application instead of performing its own selection,
+        so drag-to-select stops working. That is the only way to copy text out
+        of a session over SSH, and a scroll wheel is not worth losing it.
+        """
+        return os.environ.get("WHEELJACK_MOUSE", "").strip().lower() in (
+            "1", "true", "yes", "on")
+
+    def _enable_mouse(self) -> None:
+        if not self._mouse_enabled():
+            return
         curses = self.curses
-        curses.curs_set(1)
-        stdscr.keypad(True)
-        stdscr.timeout(50)
-        # Enable wheel reporting so the scrollback is reachable by mouse. This
-        # takes over drag-to-select, which is why the docs note Shift+drag.
         try:
             # This build's mousemask() takes a single mask argument, and it
             # raises TypeError (not curses.error) when called otherwise, so the
@@ -191,9 +202,15 @@ class TuiRenderer(core.BaseRenderer):
             # Short interval: wheel notches arrive as separate events rather
             # than coalescing into one click.
             curses.mouseinterval(50)
-            curses.ESCDELAY = 25
         except Exception:
             pass   # a terminal without mouse support just uses the keys
+
+    def _run(self, stdscr, app) -> None:
+        curses = self.curses
+        curses.curs_set(1)
+        stdscr.keypad(True)
+        stdscr.timeout(50)
+        self._enable_mouse()
 
         while self._running:
             try:

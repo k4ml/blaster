@@ -10,6 +10,7 @@ import hashlib
 import http.server
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wheeljack as wj  # noqa: E402
@@ -2028,13 +2030,75 @@ class TestTuiScrollback(unittest.TestCase):
         self.assertEqual(r._wheel_direction(curses.BUTTON1_PRESSED), 0)
         self.assertEqual(r._wheel_direction(0), 0)
 
+    def test_mouse_reporting_is_off_by_default(self):
+        """Selection must always work, so no mouse-enable sequence may be sent
+        unless the user opts in."""
+        r = self._renderer([])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WHEELJACK_MOUSE", None)
+            self.assertFalse(r._mouse_enabled())
+
+    def test_mouse_reporting_is_opt_in(self):
+        r = self._renderer([])
+        for value in ("1", "true", "yes", "on", "TRUE", "On"):
+            with mock.patch.dict(os.environ, {"WHEELJACK_MOUSE": value}):
+                self.assertTrue(r._mouse_enabled(), value)
+        for value in ("0", "false", "no", "off", "", "banana"):
+            with mock.patch.dict(os.environ, {"WHEELJACK_MOUSE": value}):
+                self.assertFalse(r._mouse_enabled(), value)
+
+    def test_enable_mouse_does_nothing_without_opt_in(self):
+        """The terminal must keep its own click/drag handling by default."""
+        calls = []
+
+        class RecordingCurses:
+            error = Exception
+            ALL_MOUSE_EVENTS = 1
+
+            @staticmethod
+            def mousemask(*a):
+                calls.append(("mousemask", a))
+
+            @staticmethod
+            def mouseinterval(*a):
+                calls.append(("mouseinterval", a))
+
+        r = self._renderer([])
+        r.curses = RecordingCurses()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WHEELJACK_MOUSE", None)
+            r._enable_mouse()
+        self.assertEqual(calls, [], "no mouse setup should happen by default")
+
+    def test_enable_mouse_activates_when_opted_in(self):
+        calls = []
+
+        class RecordingCurses:
+            error = Exception
+            ALL_MOUSE_EVENTS = 1
+
+            @staticmethod
+            def mousemask(*a):
+                calls.append(("mousemask", a))
+
+            @staticmethod
+            def mouseinterval(*a):
+                calls.append(("mouseinterval", a))
+
+        r = self._renderer([])
+        r.curses = RecordingCurses()
+        with mock.patch.dict(os.environ, {"WHEELJACK_MOUSE": "1"}):
+            r._enable_mouse()
+        self.assertEqual([c[0] for c in calls], ["mousemask", "mouseinterval"])
+        # Single-argument call: two args raises TypeError on this build.
+        self.assertEqual(len(calls[0][1]), 1)
+
     def test_mouse_setup_failure_does_not_break_the_tui(self):
         """mousemask() raises TypeError (not curses.error) on this build when
         called with two args. A narrow except around it once killed the entire
         TUI and silently degraded to stdio, so this pins the broad handler."""
         class HostileCurses:
             error = Exception
-            ESCDELAY = 0
             ALL_MOUSE_EVENTS = 1
 
             @staticmethod
@@ -2045,19 +2109,16 @@ class TestTuiScrollback(unittest.TestCase):
             def mouseinterval(*a):
                 raise TypeError("mouseinterval() takes exactly one argument")
 
-        curses_stub = HostileCurses()
-        # The guarded block, verbatim from _run(); it must not propagate.
-        try:
-            curses_stub.mousemask(curses_stub.ALL_MOUSE_EVENTS)
-            curses_stub.mouseinterval(50)
-        except Exception:
-            pass
-        self.assertTrue(True)   # not raising is the assertion
+        r = self._renderer([])
+        r.curses = HostileCurses()
+        with mock.patch.dict(os.environ, {"WHEELJACK_MOUSE": "1"}):
+            r._enable_mouse()      # must not raise
+        self.assertTrue(True)
 
     def test_mousemask_call_shape_is_single_argument(self):
         """Grep-level guard: two args breaks on this build."""
         import inspect
-        src = inspect.getsource(self.tui.TuiRenderer._run)
+        src = inspect.getsource(self.tui.TuiRenderer._enable_mouse)
         self.assertIn("mousemask(curses.ALL_MOUSE_EVENTS)", src)
         self.assertNotIn("mousemask(curses.ALL_MOUSE_EVENTS,", src)
         self.assertIn("except Exception", src)
