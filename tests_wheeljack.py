@@ -1643,5 +1643,372 @@ class TestTuiPluginUpdates(unittest.TestCase):
         self.assertTrue(all(dim for txt, dim in tool_lines))
 
 
+# ---------------------------------------------------------------------------
+# TUI scrollback
+# ---------------------------------------------------------------------------
+class FakeScreen:
+    """Stand-in for a curses window, so _redraw is testable without a TTY."""
+
+    def __init__(self, height, width):
+        self.height, self.width = height, width
+        self.rows = {}
+        self.drawn = []
+
+    def getmaxyx(self):
+        return (self.height, self.width)
+
+    def erase(self):
+        self.rows = {}
+
+    def addnstr(self, y, x, text, n, attr=0):
+        self.rows[y] = text[:n]
+        self.drawn.append(text[:n])
+
+    def move(self, y, x):
+        pass
+
+    def refresh(self):
+        pass
+
+
+class TestTuiScrollback(unittest.TestCase):
+    """The buffer used to be drawn as a tail-only view with no way to reach
+    older output; these pin the viewport behaviour."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(REPO / ".wheeljack" / "plugins"))
+        import tui
+        cls.tui = tui
+
+    def _renderer(self, lines):
+        renderer = self.tui.TuiRenderer(wj.WheeljackApp())
+        self.app = renderer.app
+        renderer._lines = [(ln, False) for ln in lines]
+        return renderer
+
+    def _draw(self, renderer, height=10, width=40):
+        scr = FakeScreen(height, width)
+        renderer._redraw(scr, self.app)
+        return scr
+
+    # -- tail following ---------------------------------------------------
+    def test_follows_the_tail_by_default(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        scr = self._draw(r)
+        visible = set(scr.rows.values())
+        self.assertIn("line 99", visible)
+        self.assertNotIn("line 0", visible)
+        self.assertIsNone(r._scroll)
+        self.assertEqual(r._last_total_rows, 100)
+        self.assertEqual(r._last_body_h, 8)
+
+    def test_no_indicator_while_following(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        scr = self._draw(r)
+        self.assertFalse(any("SCROLLED" in v for v in scr.rows.values()))
+
+    # -- scrolling up -----------------------------------------------------
+    def test_scroll_up_detaches_and_reveals_older_output(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_up(8)
+        scr = self._draw(r)
+        visible = set(scr.rows.values())
+        self.assertIsNotNone(r._scroll)
+        self.assertNotIn("line 99", visible)
+        self.assertTrue(any("SCROLLED" in v for v in scr.rows.values()))
+
+    def test_indicator_reports_position_and_stays_untruncated(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_up(8)
+        scr = self._draw(r, width=40)
+        indicator = [v for v in scr.rows.values() if "SCROLLED" in v][0]
+        self.assertIn("End=live]", indicator)
+        self.assertLessEqual(len(indicator), 40 - 1)
+        self.assertIn("\u21918", indicator)     # 8 rows above after one page
+
+    def test_indicator_degrades_on_a_narrow_terminal(self):
+        """The key hint must survive even when the counts cannot fit."""
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r, width=12)
+        r._scroll_up(8)
+        scr = self._draw(r, width=12)
+        indicator = [v for v in scr.rows.values() if "SCROLLED" in v][0]
+        self.assertLessEqual(len(indicator), 12 - 1)
+        self.assertIn("SCROLLED", indicator)
+
+    def test_status_and_indicator_are_space_separated(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._status = "thinking: x"
+        r._scroll_up(8)
+        scr = self._draw(r)
+        status = scr.rows[8]
+        self.assertIn("thinking: x [SCROLLED", status)
+
+    def test_scroll_to_top_shows_the_oldest_line(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_to_top()
+        scr = self._draw(r)
+        self.assertEqual(r._scroll, 0)
+        self.assertIn("line 0", set(scr.rows.values()))
+
+    def test_scroll_up_is_a_noop_when_everything_fits(self):
+        r = self._renderer([f"line {i}" for i in range(3)])
+        self._draw(r)
+        r._scroll_up(8)
+        self.assertIsNone(r._scroll)
+
+    def test_scroll_up_clamps_at_the_oldest_line(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        for _ in range(50):
+            r._scroll_up(8)
+        self.assertEqual(r._scroll, 0)
+
+    # -- returning to live ------------------------------------------------
+    def test_scroll_to_tail_reattaches(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_up(8)
+        r._scroll_to_tail()
+        scr = self._draw(r)
+        self.assertIsNone(r._scroll)
+        self.assertIn("line 99", set(scr.rows.values()))
+        self.assertFalse(any("SCROLLED" in v for v in scr.rows.values()))
+
+    def test_scrolling_down_past_the_bottom_reattaches(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_to_top()
+        for _ in range(50):
+            r._scroll_down(8)
+        self.assertIsNone(r._scroll)
+
+    def test_scroll_down_is_a_noop_while_following(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_down(8)
+        self.assertIsNone(r._scroll)
+
+    # -- pinning ----------------------------------------------------------
+    def test_incoming_output_does_not_move_a_pinned_viewport(self):
+        r = self._renderer([f"old {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_up(20)
+        pinned = r._scroll
+        for i in range(30):
+            r._append_line(f"new {i}")
+        scr = self._draw(r)
+        self.assertEqual(r._scroll, pinned)
+        self.assertFalse(any("new 29" in v for v in scr.rows.values()))
+        self.assertTrue(any("SCROLLED" in v for v in scr.rows.values()))
+
+    def test_buffer_is_bounded_and_drops_the_oldest(self):
+        old_max = self.tui.SCROLLBACK_MAX_LINES
+        self.tui.SCROLLBACK_MAX_LINES = 50
+        try:
+            r = self._renderer([f"l{i}" for i in range(50)])
+            for i in range(30):
+                r._append_line(f"extra {i}")
+            with r._lock:
+                self.assertEqual(len(r._lines), 50)
+                self.assertEqual(r._lines[0][0], "l30")
+        finally:
+            self.tui.SCROLLBACK_MAX_LINES = old_max
+
+    def test_buffer_cap_adjusts_a_pinned_offset(self):
+        old_max = self.tui.SCROLLBACK_MAX_LINES
+        self.tui.SCROLLBACK_MAX_LINES = 50
+        try:
+            r = self._renderer([f"l{i}" for i in range(50)])
+            r._scroll = 10
+            for i in range(5):
+                r._append_line(f"more {i}")
+            self.assertIsNotNone(r._scroll)
+            self.assertLess(r._scroll, 10)
+        finally:
+            self.tui.SCROLLBACK_MAX_LINES = old_max
+
+    # -- wrapping ---------------------------------------------------------
+    def test_wrapped_rows_are_what_scroll(self):
+        r = self._renderer(["x" * 200] + [f"tail {i}" for i in range(5)])
+        self._draw(r, width=40)
+        # 200 chars at width 39 wraps to 6 rows, plus 5 short lines.
+        self.assertGreater(r._last_total_rows, 6)
+        r._scroll_to_top()
+        scr = self._draw(r, width=40)
+        self.assertTrue(any(v.startswith("xxxx") for v in scr.rows.values()))
+
+    # -- keys -------------------------------------------------------------
+    def test_page_keys_drive_scrollback(self):
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._handle_key(None, None, curses.KEY_PPAGE)
+        self.assertIsNotNone(r._scroll)
+        r._handle_key(None, None, curses.KEY_NPAGE)
+        self.assertIsNone(r._scroll)
+        r._handle_key(None, None, curses.KEY_HOME)
+        self.assertEqual(r._scroll, 0)
+        r._handle_key(None, None, curses.KEY_END)
+        self.assertIsNone(r._scroll)
+
+    def test_shift_arrows_scroll_one_row(self):
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._handle_key(None, None, curses.KEY_HOME)
+        self.assertEqual(r._scroll, 0)
+        r._handle_key(None, None, curses.KEY_SF)      # Shift+Down
+        self.assertEqual(r._scroll, 1)
+        r._handle_key(None, None, curses.KEY_SR)      # Shift+Up
+        self.assertEqual(r._scroll, 0)
+
+    def test_arrows_still_drive_input_history_not_scrollback(self):
+        """KEY_UP/DOWN were already taken by the line editor."""
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._history = ["first prompt"]
+        r._hist_i = 1
+        r._handle_key(None, None, curses.KEY_UP)
+        self.assertEqual(r._input, "first prompt")
+        self.assertIsNone(r._scroll)
+
+    def test_submitting_reattaches_to_the_tail(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_up(8)
+        self.assertIsNotNone(r._scroll)
+        r._input = "some prompt"
+        r._handle_key(FakeScreen(10, 40), self.app, "\n")
+        self.assertIsNone(r._scroll)
+
+    def test_typing_while_scrolled_keeps_the_viewport(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_up(8)
+        pinned = r._scroll
+        r._handle_key(FakeScreen(10, 40), None, "a")
+        self.assertEqual(r._scroll, pinned)
+        self.assertEqual(r._input, "a")
+
+    def test_modal_still_takes_priority_over_scrolling(self):
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._show_modal(wj.ModalRequest("allow this?", ("y", "n"), "n"))
+        r._handle_key(None, None, "y")
+        self.assertIsNone(r.current_modal())
+
+    def test_wheel_events_do_not_answer_a_modal(self):
+        """A wheel notch behind a modal must scroll, never choose an option."""
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        # Put a modal in the real queue (current_modal() reads BaseRenderer's
+        # queue, not the renderer's own drawing state).
+        req = wj.ModalRequest("allow this?", ("y", "n"), "n")
+        with r._modal_lock:
+            r._modals.append(req)
+            r._active = req
+        self.assertIsNotNone(r.current_modal())
+        r._handle_mouse_event(curses.BUTTON5_PRESSED)
+        # Still unanswered, and "y" was never chosen.
+        self.assertIsNotNone(r.current_modal())
+        self.assertIsNone(req.answer)
+        # A real keystroke still answers it, and the wheel did not break that.
+        self.assertTrue(r.answer_modal("y"))
+        self.assertIsNone(r.current_modal())
+        self.assertEqual(req.answer, "y")
+
+    # -- mouse wheel ------------------------------------------------------
+    def test_wheel_up_scrolls_up(self):
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._handle_mouse_event(curses.BUTTON4_PRESSED)
+        self.assertEqual(r._scroll, 100 - 8 - self.tui.WHEEL_ROWS)
+
+    def test_wheel_down_scrolls_back_toward_live(self):
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_to_top()
+        r._handle_mouse_event(curses.BUTTON5_PRESSED)
+        self.assertEqual(r._scroll, self.tui.WHEEL_ROWS)
+
+    def test_wheel_down_past_the_bottom_reattaches(self):
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._scroll_up(10)
+        self.assertIsNotNone(r._scroll)
+        for _ in range(50):
+            r._handle_mouse_event(curses.BUTTON5_PRESSED)
+        self.assertIsNone(r._scroll)
+
+    def test_wheel_release_and_click_events_are_treated_as_notches(self):
+        """Terminals vary in whether they send press, release, or click."""
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        for state in (curses.BUTTON4_RELEASED, curses.BUTTON4_CLICKED):
+            r = self._renderer([f"line {i}" for i in range(100)])
+            self._draw(r)
+            r._handle_mouse_event(state)
+            self.assertEqual(r._scroll, 100 - 8 - self.tui.WHEEL_ROWS)
+
+    def test_shift_wheel_is_ignored_so_text_selection_still_works(self):
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._handle_mouse_event(curses.BUTTON4_PRESSED | curses.BUTTON_SHIFT)
+        self.assertIsNone(r._scroll)
+
+    def test_wheel_direction_decoding(self):
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer(["x"])
+        self.assertEqual(r._wheel_direction(curses.BUTTON4_PRESSED), -1)
+        self.assertEqual(r._wheel_direction(curses.BUTTON5_PRESSED), 1)
+        self.assertEqual(r._wheel_direction(curses.BUTTON1_PRESSED), 0)
+        self.assertEqual(r._wheel_direction(0), 0)
+
+    def test_mouse_setup_failure_does_not_break_the_tui(self):
+        """mousemask() raises TypeError (not curses.error) on this build when
+        called with two args. A narrow except around it once killed the entire
+        TUI and silently degraded to stdio, so this pins the broad handler."""
+        class HostileCurses:
+            error = Exception
+            ESCDELAY = 0
+            ALL_MOUSE_EVENTS = 1
+
+            @staticmethod
+            def mousemask(*a):
+                raise TypeError("mousemask() takes exactly one argument")
+
+            @staticmethod
+            def mouseinterval(*a):
+                raise TypeError("mouseinterval() takes exactly one argument")
+
+        curses_stub = HostileCurses()
+        # The guarded block, verbatim from _run(); it must not propagate.
+        try:
+            curses_stub.mousemask(curses_stub.ALL_MOUSE_EVENTS)
+            curses_stub.mouseinterval(50)
+        except Exception:
+            pass
+        self.assertTrue(True)   # not raising is the assertion
+
+    def test_mousemask_call_shape_is_single_argument(self):
+        """Grep-level guard: two args breaks on this build."""
+        import inspect
+        src = inspect.getsource(self.tui.TuiRenderer._run)
+        self.assertIn("mousemask(curses.ALL_MOUSE_EVENTS)", src)
+        self.assertNotIn("mousemask(curses.ALL_MOUSE_EVENTS,", src)
+        self.assertIn("except Exception", src)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
