@@ -1870,17 +1870,6 @@ class TestTuiScrollback(unittest.TestCase):
         r._handle_key(None, None, curses.KEY_SR)      # Shift+Up
         self.assertEqual(r._scroll, 0)
 
-    def test_arrows_still_drive_input_history_not_scrollback(self):
-        """KEY_UP/DOWN were already taken by the line editor."""
-        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
-        r = self._renderer([f"line {i}" for i in range(100)])
-        self._draw(r)
-        r._history = ["first prompt"]
-        r._hist_i = 1
-        r._handle_key(None, None, curses.KEY_UP)
-        self.assertEqual(r._input, "first prompt")
-        self.assertIsNone(r._scroll)
-
     def test_submitting_reattaches_to_the_tail(self):
         r = self._renderer([f"line {i}" for i in range(100)])
         self._draw(r)
@@ -2092,6 +2081,135 @@ class TestTuiScrollback(unittest.TestCase):
         self.assertEqual([c[0] for c in calls], ["mousemask", "mouseinterval"])
         # Single-argument call: two args raises TypeError on this build.
         self.assertEqual(len(calls[0][1]), 1)
+
+    def test_arrows_scroll_the_viewport(self):
+        """Alternate-scroll mode (1007) sends arrow keys for the wheel, so
+        Up/Down must move the viewport even at the tail."""
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        self.assertEqual(r._scroll, None)
+        r._handle_key(None, None, curses.KEY_UP)          # detaches from tail
+        self.assertIsNotNone(r._scroll)
+        first = r._scroll
+        r._handle_key(None, None, curses.KEY_UP)
+        self.assertEqual(r._scroll, first - self.tui.WHEEL_ROWS)
+        r._handle_key(None, None, curses.KEY_DOWN)
+        self.assertEqual(r._scroll, first)
+        # Coming back down past the tail re-attaches.
+        r._handle_key(None, None, curses.KEY_DOWN)
+        self.assertIsNone(r._scroll)
+
+    def test_arrow_keys_never_hijack_input_history(self):
+        """KEY_UP is the wheel under 1007, so it must not recall history -
+        otherwise scrolling would be impossible at the tail."""
+        curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._history = ["earlier prompt"]
+        r._hist_i = 1
+        r._handle_key(None, None, curses.KEY_UP)
+        self.assertEqual(r._input, "")            # history NOT recalled
+        self.assertIsNotNone(r._scroll)           # scrolled instead
+
+    def test_ctrl_p_and_ctrl_n_recall_history(self):
+        """History moved to the readline bindings, since the arrows scroll."""
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r._history = ["first", "second"]
+        r._hist_i = len(r._history)
+        r._handle_key(None, None, "\x10")          # Ctrl+P
+        self.assertEqual(r._input, "second")
+        r._handle_key(None, None, "\x10")
+        self.assertEqual(r._input, "first")
+        r._handle_key(None, None, "\x0e")          # Ctrl+N
+        self.assertEqual(r._input, "second")
+        r._handle_key(None, None, "\x0e")
+        self.assertEqual(r._input, "")
+        self.assertIsNone(r._scroll)               # never touched the viewport
+
+    def test_alt_scroll_is_enabled_without_capturing_the_mouse(self):
+        """The whole point: the wheel works and selection still works."""
+        writes = []
+        r = self._renderer([])
+        r._write_terminal = lambda seq: writes.append(seq)
+        r._enable_alt_scroll()
+        self.assertEqual(writes, ["\x1b[?1007h"])
+        r._disable_alt_scroll()
+        self.assertEqual(writes, ["\x1b[?1007h", "\x1b[?1007l"])
+
+    def test_alt_scroll_does_not_require_mouse_opt_in(self):
+        r = self._renderer([])
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WHEELJACK_MOUSE", None)
+            self.assertFalse(r._mouse_enabled())   # no capture...
+        writes = []
+        r._write_terminal = lambda seq: writes.append(seq)
+        r._enable_alt_scroll()
+        self.assertEqual(writes, ["\x1b[?1007h"])   # ...but the wheel works
+
+    def test_run_sets_escape_delay_for_wheel_latency(self):
+        """Every wheel notch is an escape sequence; the ~1s default ESCDELAY
+        makes them feel laggy and can drop a pending one."""
+        writes = []
+        r = self._renderer([])
+        r._write_terminal = lambda seq: writes.append(seq)
+
+        class Curses:
+            error = Exception
+            curs_set = staticmethod(lambda *a: None)
+
+            def __setattr__(self, k, v):
+                writes.append(f"{k}={v}")
+
+        r.curses = Curses()
+        r._running = False
+
+        class Screen:
+            def keypad(self, *a):
+                pass
+
+            def timeout(self, *a):
+                pass
+
+        r._run(Screen(), wj.WheeljackApp())
+        self.assertIn("ESCDELAY=25", writes)
+
+    def test_escape_delay_failure_is_not_fatal(self):
+        """Not settable on every build; it is only a latency tweak."""
+        r = self._renderer([])
+
+        class Hostile:
+            error = Exception
+            curs_set = staticmethod(lambda *a: None)
+
+            def __setattr__(self, k, v):
+                raise AttributeError("ESCDELAY not supported")
+
+        r.curses = Hostile()
+        r._configure_escape_timing()      # must not raise
+        self.assertTrue(True)
+
+    def test_run_enables_and_disables_alt_scroll(self):
+        """_run must turn 1007 on and, on the way out, back off."""
+        writes = []
+        r = self._renderer([])
+        r._write_terminal = lambda seq: writes.append(seq)
+        r.curses = type("Curses", (), {
+            "error": Exception,
+            "curs_set": staticmethod(lambda *a: None),
+        })()
+        r._running = False          # exit the loop immediately
+
+        class Screen:
+            def keypad(self, *a):
+                pass
+
+            def timeout(self, *a):
+                pass
+
+        r._run(Screen(), wj.WheeljackApp())
+        self.assertEqual(writes, ["\x1b[?1007h", "\x1b[?1007l"])
 
     def test_mouse_setup_failure_does_not_break_the_tui(self):
         """mousemask() raises TypeError (not curses.error) on this build when

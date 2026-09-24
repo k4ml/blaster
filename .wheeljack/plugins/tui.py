@@ -15,15 +15,18 @@ Design notes (vs the old in-core CursesRenderer):
     - a growable scrollback of logical lines that WRAPS, instead of a fixed
       2000-row pad that raised curses.error once it filled
     - real scrollback: PgUp/PgDn scroll by a page, Shift+Up/Down by a row,
-      Home/End jump to the oldest line and back to the tail, and the mouse
-      wheel scrolls a few rows when WHEELJACK_MOUSE=1 is set. Scrolling up
-      detaches from the tail so incoming output does not move the text you
-      are reading; End (or PgDn past the bottom) re-attaches
-    - mouse-wheel reporting is OFF by default and opt-in via WHEELJACK_MOUSE=1.
-      Turning it on makes the terminal deliver clicks and drags to this app
-      instead of doing its own selection, which silently breaks drag-to-select
-      for copy - the normal way to copy text out of an SSH session. Selection
-      is the thing that must always work, so it wins by default
+      Home/End jump to the oldest line and back to the tail. The mouse wheel
+      also scrolls, via alternate-scroll mode (DECSET 1007) rather than mouse
+      capture. Scrolling up detaches from the tail so incoming output does not
+      move the text you are reading; End (or PgDn past the bottom) re-attaches
+    - drag-to-select is never captured, so copying text works normally - which
+      matters most over SSH. The wheel works AND selection works because the
+      terminal translates wheel notches into arrow keys (1007) instead of
+      handing the app raw mouse events. Explicit capture is still available
+      with WHEELJACK_MOUSE=1 for terminals that do not implement 1007, at the
+      cost of the terminal's own selection
+    - while scrolled back, Up/Down move the viewport (that is what 1007 sends);
+      while following the tail they recall input history
     - redraw only when dirty, not every 50 ms unconditionally
     - keypad(True) + get_wch() so arrows/unicode/KEY_RESIZE work
     - a real line editor in the input box (history, cursor movement)
@@ -180,15 +183,54 @@ class TuiRenderer(core.BaseRenderer):
         self.curses.wrapper(self._run, app)
 
     def _mouse_enabled(self) -> bool:
-        """Mouse reporting is opt-in.
+        """Explicit mouse capture is opt-in.
 
-        It must default to off: enabling it makes the terminal route clicks
-        and drags to this application instead of performing its own selection,
-        so drag-to-select stops working. That is the only way to copy text out
-        of a session over SSH, and a scroll wheel is not worth losing it.
+        Enabling it makes the terminal route clicks and drags to this
+        application instead of performing its own selection, so drag-to-select
+        stops working. That is the only way to copy text out of a session over
+        SSH, so it is not worth doing by default - the wheel is handled by
+        alternate-scroll mode instead (see _enable_alt_scroll).
         """
         return os.environ.get("WHEELJACK_MOUSE", "").strip().lower() in (
             "1", "true", "yes", "on")
+
+    def _write_terminal(self, seq: str) -> None:
+        """Emit a control sequence curses has no API for."""
+        try:
+            os.write(sys.stdout.fileno(), seq.encode())
+        except Exception:
+            pass
+
+    def _configure_escape_timing(self) -> None:
+        """Shorten the escape-sequence timeout.
+
+        Every wheel notch arrives as an escape sequence (ESC[OA / ESC[OB via
+        alternate-scroll mode, or SGR mouse reports when capture is on). The
+        default ESCDELAY is around a second, which makes those keystrokes feel
+        laggy and can drop a pending escape when the next byte is not already
+        buffered. 25 ms is the usual choice for an application that reads keys
+        in a loop like this one.
+        """
+        try:
+            self.curses.ESCDELAY = 25
+        except Exception:
+            pass   # not settable on every build; purely a latency tweak
+
+    def _enable_alt_scroll(self) -> None:
+        """Turn wheel notches into Up/Down keys, without capturing the mouse.
+
+        This is DECSET 1007 (alternate scroll mode), the same mechanism `less`
+        and `man` use: the terminal itself translates the wheel into arrow
+        keys while the alternate screen is active, so scrolling works AND the
+        terminal keeps its own drag-to-select. Without it the alternate screen
+        has no scrollback for the wheel to move, which leaves the wheel dead.
+
+        Terminals that do not implement 1007 simply ignore it.
+        """
+        self._write_terminal("\x1b[?1007h")
+
+    def _disable_alt_scroll(self) -> None:
+        self._write_terminal("\x1b[?1007l")
 
     def _enable_mouse(self) -> None:
         if not self._mouse_enabled():
@@ -210,21 +252,25 @@ class TuiRenderer(core.BaseRenderer):
         curses.curs_set(1)
         stdscr.keypad(True)
         stdscr.timeout(50)
+        self._configure_escape_timing()
         self._enable_mouse()
+        self._enable_alt_scroll()
+        try:
+            while self._running:
+                try:
+                    ch = stdscr.get_wch()
+                except curses.error:
+                    ch = None  # timeout: no key this tick
+                except (KeyboardInterrupt, EOFError):
+                    break
 
-        while self._running:
-            try:
-                ch = stdscr.get_wch()
-            except curses.error:
-                ch = None  # timeout: no key this tick
-            except (KeyboardInterrupt, EOFError):
-                break
+                if ch is not None:
+                    self._handle_key(stdscr, app, ch)
 
-            if ch is not None:
-                self._handle_key(stdscr, app, ch)
-
-            if self._dirty:
-                self._redraw(stdscr, app)
+                if self._dirty:
+                    self._redraw(stdscr, app)
+        finally:
+            self._disable_alt_scroll()
 
     def _handle_key(self, stdscr, app, ch) -> None:
         curses = self.curses
@@ -268,9 +314,16 @@ class TuiRenderer(core.BaseRenderer):
             self._cursor = min(len(self._input), self._cursor + 1)
             self._dirty = True
         elif ch == curses.KEY_UP:
-            # KEY_UP is input history; scrollback uses PgUp / Shift+Up.
-            self._history_up()
+            # These keys mean "scroll" here, because alternate-scroll mode
+            # turns every wheel notch into an arrow key - if they recalled
+            # input history instead, the wheel would do nothing at the tail.
+            # History therefore lives on Ctrl+P / Ctrl+N (readline's binding).
+            self._scroll_up(WHEEL_ROWS)
         elif ch == curses.KEY_DOWN:
+            self._scroll_down(WHEEL_ROWS)
+        elif ch == "\x10":                   # Ctrl+P: previous prompt
+            self._history_up()
+        elif ch == "\x0e":                   # Ctrl+N: next prompt
             self._history_down()
         elif ch == curses.KEY_PPAGE:
             self._scroll_up(self._last_body_h or 1)
