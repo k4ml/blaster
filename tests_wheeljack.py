@@ -1967,6 +1967,59 @@ class TestTuiScrollback(unittest.TestCase):
         r._handle_mouse_event(curses.BUTTON4_PRESSED | curses.BUTTON_SHIFT)
         self.assertIsNone(r._scroll)
 
+    def test_mouse_dispatch_end_to_end_without_a_tty(self):
+        """The real path: KEY_MOUSE -> curses.getmouse() -> scroll.
+
+        The pty harnesses cannot deliver individual wheel notches reliably
+        (they coalesce), so the up/down cycle is pinned here instead, by
+        stubbing getmouse() and driving _handle_key exactly as the loop does.
+        """
+        class FakeCurses:
+            error = Exception
+            KEY_MOUSE = 409
+            BUTTON4_PRESSED = 0x10000
+            BUTTON5_PRESSED = 0x200000
+            BUTTON_SHIFT = 0x4000000
+
+            def __init__(self, bstate):
+                self.bstate = bstate
+
+            def getmouse(self):
+                return (0, 5, 5, 0, self.bstate)
+
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)                      # publishes the geometry
+        tail_top = 100 - r._last_body_h
+
+        # Wheel up: detach and move exactly WHEEL_ROWS.
+        r.curses = FakeCurses(FakeCurses.BUTTON4_PRESSED)
+        r._handle_key(None, None, FakeCurses.KEY_MOUSE)
+        self.assertEqual(r._scroll, tail_top - self.tui.WHEEL_ROWS)
+
+        # Wheel down: straight back to live, clearing the pin.
+        r.curses = FakeCurses(FakeCurses.BUTTON5_PRESSED)
+        r._handle_key(None, None, FakeCurses.KEY_MOUSE)
+        self.assertIsNone(r._scroll)
+
+        # Down again at the tail is a no-op rather than an error.
+        r._handle_key(None, None, FakeCurses.KEY_MOUSE)
+        self.assertIsNone(r._scroll)
+
+    def test_mouse_getmouse_failure_is_swallowed(self):
+        """A stale event queue must not crash the UI thread."""
+        class FailingCurses:
+            error = Exception
+            KEY_MOUSE = 409
+
+            def getmouse(self):
+                raise Exception("no mouse event queued")
+
+        r = self._renderer([f"line {i}" for i in range(100)])
+        self._draw(r)
+        r.curses = FailingCurses()
+        r._handle_key(None, None, FailingCurses.KEY_MOUSE)   # must not raise
+        self.assertIsNone(r._scroll)
+
     def test_wheel_direction_decoding(self):
         curses = self.tui.TuiRenderer(wj.WheeljackApp()).curses
         r = self._renderer(["x"])
