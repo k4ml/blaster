@@ -18,6 +18,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import wheeljack as wj  # noqa: E402
@@ -58,6 +59,20 @@ class AllowRenderer(DenyRenderer):
     def confirm(self, prompt, **kw):
         self.prompts.append(prompt)
         return "y"
+
+
+class RecordingRenderer(QuietRenderer):
+    """Captures every log line, so tests can assert on user-visible output."""
+
+    def __init__(self, app=None):
+        super().__init__(app)
+        self.lines = []
+
+    def log_message(self, e):
+        self.lines.append(e.text)
+
+    def text(self):
+        return "\n".join(self.lines)
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +271,55 @@ class TestSlashDispatch(unittest.TestCase):
         app.plugin_names.append("wheeljack_tui")
         app.submit_line("/plugins")
         self.assertTrue(any("wheeljack_tui" in m for m in app._log))
+
+    def test_reasoning_command_prints_the_captured_block(self):
+        """Regression: /reasoning resolved app.agent on the input thread's
+        locals, so it always claimed nothing was captured."""
+        app = wj.WheeljackApp()
+        agent = SimpleNamespace(reasoning_text="step one\nstep two\n")
+        app.agent = agent
+        app.submit_line("/reasoning")
+        text = "\n".join(app._log)
+        self.assertIn("step one", text)
+        self.assertIn("step two", text)
+        self.assertNotIn("no reasoning captured", text)
+
+    def test_reasoning_command_without_a_block_explains(self):
+        app = wj.WheeljackApp()
+        app.agent = SimpleNamespace(reasoning_text="")
+        app.submit_line("/reasoning")
+        self.assertTrue(any("no reasoning captured" in m for m in app._log))
+
+    def test_reasoning_accumulates_through_events(self):
+        """The agent collects ReasoningDelta events in order for /reasoning."""
+        app = wj.WheeljackApp()
+        app._renderer = QuietRenderer()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = wj.Config(cwd=Path(td), session_enabled=False)
+            agent = wj.Agent(app, cfg, Path(td))
+            try:
+                app.emit(wj.ReasoningDelta("first "))
+                app.emit(wj.ReasoningDelta("second"))
+                self.assertEqual(agent.reasoning_text, "first second")
+            finally:
+                agent.close()
+
+    def test_reasoning_command_reads_the_current_agent(self):
+        """A second Agent on the same app must not be mistaken for the first."""
+        app = wj.WheeljackApp()
+        app._renderer = QuietRenderer()
+        with tempfile.TemporaryDirectory() as td:
+            cfg = wj.Config(cwd=Path(td), session_enabled=False)
+            first = wj.Agent(app, cfg, Path(td))
+            second = wj.Agent(app, cfg, Path(td))
+            try:
+                self.assertIs(app.agent, second)
+                app.emit(wj.ReasoningDelta("only the live agent"))
+                self.assertEqual(second.reasoning_text, "only the live agent")
+                self.assertEqual(first.reasoning_text, "")
+            finally:
+                first.close()
+                second.close()
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +673,42 @@ class TestLLMClient(unittest.TestCase):
             self.assertEqual(resp.content, "single json response")
             self.assertFalse(resp.streamed)
 
+    def test_request_sets_stream_true(self):
+        with MockChatServer(scenario="plain") as srv:
+            cfg = wj.Config(api_base=srv.api_base, request_timeout=5)
+            client = wj.LLMClient(cfg, emit=lambda e: None)
+            client.call([wj.Message("user", "hi")])
+            self.assertTrue(srv.requests, "server saw no request")
+            self.assertIs(srv.requests[0].get("stream"), True)
+            self.assertEqual(srv.requests[0].get("model"), cfg.model)
+
+    def test_toolcall_reassembled_by_the_client(self):
+        with MockChatServer(scenario="toolcall") as srv:
+            cfg = wj.Config(api_base=srv.api_base, request_timeout=5)
+            client = wj.LLMClient(cfg, emit=lambda e: None)
+            resp = client.call([wj.Message("user", "hi")])
+            self.assertEqual(len(resp.tool_calls), 1)
+            self.assertEqual(resp.tool_calls[0]["id"], "call_1")
+            self.assertEqual(resp.tool_calls[0]["function"]["name"], "read_file")
+            self.assertEqual(json.loads(resp.tool_calls[0]["function"]["arguments"]),
+                             {"path": "hello.txt"})
+            # A tool-call round must not be reported as a streamed answer.
+            self.assertFalse(resp.streamed)
+
+    def test_slow_stream_survives_a_short_request_timeout(self):
+        """Streaming keeps a long generation alive: the per-read timeout applies
+        to each chunk, not the whole response, so a slow stream still completes
+        even when the total time exceeds request_timeout."""
+        with MockChatServer(scenario="slow_content", delay=0.4) as srv:
+            cfg = wj.Config(api_base=srv.api_base, request_timeout=1)
+            client = wj.LLMClient(cfg, emit=lambda e: None)
+            t0 = time.time()
+            resp = client.call([wj.Message("user", "hi")])
+            elapsed = time.time() - t0
+            self.assertEqual(resp.content, "Hello from slow stream.")
+            self.assertGreater(elapsed, 1.0)   # outlived the request_timeout
+            self.assertTrue(resp.streamed)
+
     def test_cancel_between_chunks(self):
         cancel_ev = threading.Event()
         with MockChatServer(scenario="slow_content", delay=0.1) as srv:
@@ -748,6 +848,45 @@ class TestCoreToolsAndGates(unittest.TestCase):
         shell_fn({"command": "echo safe"})
         self.assertEqual(self.app._renderer.prompts, [])
 
+    def test_plugin_tool_is_advertised_in_the_schema(self):
+        """Core tools and plugin tools share one advertisement path."""
+        cfg = wj.Config(cwd=self.root)
+        wj.register_core_tools(self.app, cfg, self.root)
+        self.app.add_tool("web_fetch", {
+            "description": "Fetch a URL.",
+            "parameters": {"url": ("string", "URL to fetch")},
+            "required": ["url"],
+            "parallel_safe": True,
+        }, lambda a: "body")
+
+        schema = wj._tools_schema(self.app)
+        names = [t["function"]["name"] for t in schema]
+        self.assertIn("web_fetch", names)
+        for core in ("read_file", "write_file", "edit_file",
+                     "list_files", "run_shell", "run_interactive"):
+            self.assertIn(core, names)
+
+        entry = next(t for t in schema if t["function"]["name"] == "web_fetch")
+        self.assertEqual(entry["type"], "function")
+        self.assertEqual(entry["function"]["description"], "Fetch a URL.")
+        params = entry["function"]["parameters"]
+        self.assertEqual(params["type"], "object")
+        self.assertEqual(params["properties"]["url"]["type"], "string")
+        self.assertEqual(params["required"], ["url"])
+        # parallel_safe is internal, not part of the OpenAI schema.
+        self.assertNotIn("parallel_safe", entry["function"])
+
+    def test_core_tools_have_no_extended_tools(self):
+        """The plan keeps extended tools (web_fetch et al.) out of core."""
+        cfg = wj.Config(cwd=self.root)
+        wj.register_core_tools(self.app, cfg, self.root)
+        self.assertEqual(
+            sorted(self.app.tools),
+            ["edit_file", "list_files", "read_file", "run_interactive",
+             "run_shell", "write_file"])
+        for name in ("web_fetch", "web_search", "grep"):
+            self.assertNotIn(name, self.app.tools)
+
 
 # ---------------------------------------------------------------------------
 # Tool Executor (read-only parallel, mutating serial, call-order preserved)
@@ -854,6 +993,146 @@ class TestToolExecutor(unittest.TestCase):
             self.assertEqual(len(results), 2)
             self.assertTrue(results[0].startswith("Error: Unknown tool"))
             self.assertTrue(results[1].startswith("Error: Unknown tool"))
+
+
+# ---------------------------------------------------------------------------
+# Conversation summary — generated each turn, shown when a session resumes
+# ---------------------------------------------------------------------------
+class TestConversationSummary(unittest.TestCase):
+    def _agent(self, td, **cfg_kw):
+        app = wj.WheeljackApp()
+        app._renderer = RecordingRenderer()
+        cfg = wj.Config(cwd=Path(td), session_enabled=False, **cfg_kw)
+        return app, wj.Agent(app, cfg, Path(td))
+
+    def test_summary_generated_after_a_turn(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, agent = self._agent(td)
+            agent.messages.append(wj.Message(
+                role="user", content="deploy the service",
+                timestamp=datetime.now().isoformat()))
+            agent.messages.append(wj.Message(
+                role="assistant", content="Deployed it.",
+                timestamp=datetime.now().isoformat()))
+            summary = agent._generate_conversation_summary()
+            self.assertIn("deploy the service", summary)
+            self.assertIn("Deployed it.", summary)
+            self.assertIn("User:", summary)
+            self.assertIn("Assistant:", summary)
+
+    def test_summary_skips_tool_and_placeholder_messages(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, agent = self._agent(td)
+            agent.messages.extend([
+                wj.Message(role="tool", content="huge tool body"),
+                wj.Message(role="user", content="real question"),
+                wj.Message(role="assistant", content="(no response)"),
+                wj.Message(role="user", content="(system) limit reached"),
+            ])
+            summary = agent._generate_conversation_summary()
+            self.assertIn("real question", summary)
+            self.assertNotIn("huge tool body", summary)
+            self.assertNotIn("(no response)", summary)
+            self.assertNotIn("limit reached", summary)
+
+    def test_summary_truncates_long_messages_instead_of_dropping(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, agent = self._agent(td)
+            agent.messages.append(wj.Message(
+                role="user", content="start " + ("x" * 500),
+                timestamp=datetime.now().isoformat()))
+            summary = agent._generate_conversation_summary()
+            self.assertIn("start", summary)
+            self.assertIn("…", summary)
+            self.assertLess(len(summary), 200)
+
+    def test_summary_keeps_only_the_last_three_exchanges(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, agent = self._agent(td)
+            for i in range(6):
+                agent.messages.append(wj.Message(
+                    role="user", content=f"question {i}",
+                    timestamp=datetime.now().isoformat()))
+                agent.messages.append(wj.Message(
+                    role="assistant", content=f"answer {i}",
+                    timestamp=datetime.now().isoformat()))
+            summary = agent._generate_conversation_summary()
+            self.assertIn("question 5", summary)
+            self.assertNotIn("question 0", summary)
+            self.assertEqual(summary.count("|"), 2)
+
+    def test_summary_of_empty_conversation_is_blank(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, agent = self._agent(td)
+            self.assertEqual(agent._generate_conversation_summary(), "")
+
+    def test_summary_persisted_and_shown_on_resume(self):
+        """The resume banner must show the summary, not just the raw tail."""
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td) / "sessions"
+            cfg = wj.Config(sessions_dir=sdir, session_enabled=True)
+            app = wj.WheeljackApp(cfg)
+            app._renderer = QuietRenderer()
+            agent = wj.Agent(app, cfg, Path(td), session_name="sum-resume")
+            agent.messages.append(wj.Message(
+                role="user", content="the original question",
+                timestamp=datetime.now().isoformat()))
+            agent.messages.append(wj.Message(
+                role="assistant", content="the original answer",
+                timestamp=datetime.now().isoformat()))
+            agent.conversation_summary = agent._generate_conversation_summary()
+            agent._save_session()
+            sid = agent.session_context.session_id
+
+            saved = json.loads((sdir / f"{sid}.json").read_text())
+            self.assertIn("the original question", saved["conversation_summary"])
+
+            # Resume with a recorder as the renderer to capture the banner.
+            app2 = wj.WheeljackApp(cfg)
+            app2._renderer = RecordingRenderer()
+            agent2 = wj.Agent(app2, cfg, Path(td), session_name="sum-resume")
+            self.assertEqual(agent2.conversation_summary,
+                             saved["conversation_summary"])
+            text = app2._renderer.text()
+            self.assertIn("summary of the previous session", text)
+            self.assertIn("the original question", text)
+            # The summary is also injected into the system prompt.
+            self.assertIn("Recent:", agent2.messages[0].content)
+            self.assertIn("the original question", agent2.messages[0].content)
+
+    def test_resume_shows_summary_when_messages_were_trimmed_away(self):
+        """A summary that survives trimming must still be displayed."""
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td) / "sessions"
+            (sdir).mkdir(parents=True)
+            sid = "abc123"
+            (sdir / f"{sid}.json").write_text(json.dumps({
+                "context": {"session_id": sid, "name": "summary-only",
+                            "created_at": datetime.now().isoformat(),
+                            "last_accessed": datetime.now().isoformat(),
+                            "message_count": 40},
+                "conversation_summary": "User: old topic | Assistant: old reply",
+                "total_tokens": 10,
+                # No user/assistant messages left — everything aged out.
+                "messages": [],
+            }))
+            cfg = wj.Config(sessions_dir=sdir, session_enabled=True)
+            app = wj.WheeljackApp(cfg)
+            app._renderer = RecordingRenderer()
+            wj.Agent(app, cfg, Path(td), session_name="summary-only")
+            text = app._renderer.text()
+            self.assertIn("summary of the previous session", text)
+            self.assertIn("old topic", text)
+
+    def test_no_summary_means_no_empty_banner(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td) / "sessions"
+            cfg = wj.Config(sessions_dir=sdir, session_enabled=True)
+            app = wj.WheeljackApp(cfg)
+            app._renderer = RecordingRenderer()
+            wj.Agent(app, cfg, Path(td), session_name="fresh-name")
+            text = app._renderer.text()
+            self.assertNotIn("summary of the previous session", text)
 
 
 # ---------------------------------------------------------------------------

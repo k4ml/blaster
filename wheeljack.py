@@ -2271,6 +2271,9 @@ class Agent(threading.Thread):
             usage = response.usage
             self.total_tokens_used += (usage.get("prompt_tokens", 0)
                                        + usage.get("completion_tokens", 0))
+            # Refresh the recap now that the exchange is complete, so a resumed
+            # session shows what it was about even if the newest turn is trimmed.
+            self.conversation_summary = self._generate_conversation_summary()
         finally:
             # Drain once more before TurnEnded so a steer arriving in the
             # final round is not dropped.
@@ -2485,20 +2488,47 @@ class Agent(threading.Thread):
         except Exception as exc:
             self.app.log(f"Could not save session: {exc}")
 
+    def _generate_conversation_summary(self) -> str:
+        """One-line recap of the most recent user/assistant exchanges.
+
+        Heuristic, not an LLM call (keeps the transport out of it): feeds the
+        system prompt's 'Recent:' line and the resume banner, so a long session
+        stays legible once `_trim_messages` starts dropping the oldest turns.
+        Long messages are truncated rather than skipped, so they still count.
+        """
+        recent = []
+        for msg in self.messages[-6:]:
+            if msg.role not in ("user", "assistant"):
+                continue
+            text = (msg.content or "").strip().replace("\n", " ")
+            if not text or text == "(no response)" or text.startswith("(system)"):
+                continue
+            if len(text) > 100:
+                text = text[:100] + "…"
+            who = "User" if msg.role == "user" else "Assistant"
+            recent.append(f"{who}: {text}")
+        return " | ".join(recent[-3:])
+
     def _show_past_messages(self) -> None:
         past = [m for m in self.messages if m.role in ("user", "assistant")
                 and m.content]
-        if len(past) <= 1:
+        summary = (self.conversation_summary or "").strip()
+        if len(past) <= 1 and not summary:
             return  # nothing restored (just the system prompt)
-        n = len(past) - 1  # exclude the (empty) initial context
-        lines = [f"— previous conversation ({n} messages) —"]
-        for m in past:
-            who = "you" if m.role == "user" else "wheeljack"
-            text = m.content.strip().replace("\n", " ")
-            if len(text) > 300:
-                text = text[:300] + "…"
-            lines.append(f"  {who}: {text}")
-        lines.append("— end of previous conversation —")
+        lines = []
+        if summary:
+            lines.append("— summary of the previous session —")
+            lines.append(f"  {summary}")
+        if len(past) > 1:
+            n = len(past) - 1  # exclude the (empty) initial context
+            lines.append(f"— previous conversation ({n} messages) —")
+            for m in past:
+                who = "you" if m.role == "user" else "wheeljack"
+                text = m.content.strip().replace("\n", " ")
+                if len(text) > 300:
+                    text = text[:300] + "…"
+                lines.append(f"  {who}: {text}")
+            lines.append("— end of previous conversation —")
         self.app.log("\n".join(lines))
 
     # -- AGENTS.md / system prompt ---------------------------------------
@@ -2566,7 +2596,11 @@ TOOL USE RULES (critical):
 Available Tools (schemas are sent with each request):
 {tool_names}
 """
-        self.messages.append(Message(role="system", content=system_prompt))
+        # The system prompt must lead the conversation. A resumed session has
+        # restored messages already queued, so appending would put it last —
+        # which also breaks _trim_messages' "messages[0] is the system prompt"
+        # assumption when the window overflows.
+        self.messages.insert(0, Message(role="system", content=system_prompt))
 
     def _get_session_info(self) -> str:
         if not self.session_context:
@@ -2888,7 +2922,11 @@ def main() -> None:
             agent.join()
         renderer.stop()
 
+    # Save on every exit path, including a SIGINT raised out of join(): the
+    # per-turn autosave can miss the final turn, so persist the summary and
+    # messages here too.
     if isinstance(agent, Agent):
+        agent.conversation_summary = agent._generate_conversation_summary()
         agent._save_session()
 
 
