@@ -2,8 +2,8 @@
 """
 Wheeljack TUI plugin — a curses renderer, loaded as a sibling plugin.
 
-Drop this file in the plugin directory (default ./wheeljack_plugins) named
-`wheeljack_tui.py`; `register(app)` installs a renderer factory. Core falls
+Drop this file in the plugin directory (default ./.wheeljack/plugins) named
+`tui.py`; `register(app)` installs a renderer factory. Core falls
 back to the stdio renderer whenever this returns None (no TTY, TERM=dumb, or
 curses unavailable), so piping/redirecting still works exactly as before.
 
@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import wheeljack as core  # resolved via the alias core installs in main()
 
@@ -49,7 +49,7 @@ class TuiRenderer(core.BaseRenderer):
         import curses  # imported lazily; stdio-only installs never need it
         self.curses = curses
         self._lock = threading.Lock()
-        self._lines: List[str] = []
+        self._lines: List[Tuple[str, bool]] = []
         self._status = ""
         self._input = ""
         self._cursor = 0
@@ -61,9 +61,9 @@ class TuiRenderer(core.BaseRenderer):
         self._dirty = True
 
     # -- event API: mutate the buffer under lock, the UI thread draws it --
-    def _append_line(self, text: str) -> None:
+    def _append_line(self, text: str, dim: bool = False) -> None:
         with self._lock:
-            self._lines.append(text)
+            self._lines.append((text, dim))
             self._dirty = True
 
     def _append_text(self, text: str) -> None:
@@ -71,27 +71,46 @@ class TuiRenderer(core.BaseRenderer):
             for i, part in enumerate(text.split("\n")):
                 if i == 0:
                     if self._lines:
-                        self._lines[-1] += part
+                        last_text, last_dim = self._lines[-1]
+                        self._lines[-1] = (last_text + part, last_dim)
                     else:
-                        self._lines.append(part)
+                        self._lines.append((part, False))
                 else:
-                    self._lines.append(part)
+                    self._lines.append((part, False))
             self._dirty = True
 
     def turn_started(self, e) -> None:
+        with self._lock:
+            self._status = ""
+            self._dirty = True
         self._append_line("")
 
     def turn_ended(self, e) -> None:
-        pass
+        with self._lock:
+            if self._status.startswith("thinking:"):
+                self._status = ""
+            self._dirty = True
+        agent = getattr(self.app, "agent", None)
+        if agent is None:
+            return
+        answer = getattr(agent, "last_answer", "") or ""
+        if answer == "(no response)":
+            self._append_line("(no response from model)")
+            return
+        if answer and not getattr(agent, "last_streamed", False):
+            self._append_line(answer)
 
     def tool_started(self, e) -> None:
-        self._append_line(f"  [tool] {e.name}({e.args}) ...")
+        self._append_line(f"  [tool] {e.name}({e.args}) ...", dim=True)
 
     def tool_finished(self, e) -> None:
         mark = "OK" if e.ok else "FAIL"
-        self._append_line(f"  [{mark}] {e.name}: {e.result}")
+        self._append_line(f"  [{mark}] {e.name}: {e.result}", dim=True)
 
     def stream_delta(self, e) -> None:
+        with self._lock:
+            if self._status.startswith("thinking:"):
+                self._status = ""
         self._append_text(e.text)
 
     def reasoning_delta(self, e) -> None:
@@ -219,16 +238,18 @@ class TuiRenderer(core.BaseRenderer):
             modal = self._modal
             self._dirty = False
 
-        rows: List[str] = []
-        for ln in lines:
-            rows.extend(_wrap(ln, width - 1))
+        rows: List[Tuple[str, bool]] = []
+        for ln, dim in lines:
+            for wrapped in _wrap(ln, width - 1):
+                rows.append((wrapped, dim))
         body_h = max(1, height - 2)
         view = rows[-body_h:] if len(rows) > body_h else rows
 
         stdscr.erase()
-        for i, row in enumerate(view):
+        for i, (row, dim) in enumerate(view):
             try:
-                stdscr.addnstr(i, 0, row, width - 1)
+                attr = curses.A_DIM if dim else 0
+                stdscr.addnstr(i, 0, row, width - 1, attr)
             except curses.error:
                 pass
 

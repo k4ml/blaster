@@ -60,7 +60,6 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
@@ -92,6 +91,10 @@ DESTRUCTIVE_PATTERNS = [
     r"\bkill\s+-9\b|\bpkill\s+-9\b", r"\bgit\s+push\s+(-f|--force)\b", r"\bmv\s+/\s+",
 ]
 SUDO_PATTERN = re.compile(r"(^|[;&|]\s*)sudo\s+")
+
+# Approval prompts must never be able to wedge a headless run: if a renderer
+# cannot answer within this window, confirm() falls back to its default (deny).
+CONFIRM_TIMEOUT = 300.0
 
 
 # --------------------------------------------------------------------------
@@ -246,6 +249,26 @@ class ToolCall:
 class LLMResponse:
     choices: List[Dict]
     usage: Dict[str, int]
+    # True when the answer arrived as stream deltas (False for the single-JSON
+    # fallback); renderers use it to decide whether the final answer still
+    # needs printing.
+    streamed: bool = False
+
+    @property
+    def message(self) -> Dict:
+        """The first choice's message ({} when the server sent none)."""
+        if not self.choices:
+            return {}
+        return self.choices[0].get("message") or {}
+
+    @property
+    def content(self) -> str:
+        """Assistant text, reassembled from the stream."""
+        return self.message.get("content") or ""
+
+    @property
+    def tool_calls(self) -> List[Dict]:
+        return self.message.get("tool_calls") or []
 
 
 @dataclass
@@ -1140,7 +1163,7 @@ def load_plugins(app: "WheeljackApp", project_dir: Path,
         if not directory.is_dir():
             continue
         for path in sorted(directory.glob("*.py")):
-            if path.name.startswith("_"):
+            if path.name.startswith("_") or path.name == "wheeljack.py":
                 continue
             name = path.stem
             if name in chosen and tier == "project":
@@ -1240,6 +1263,9 @@ def install_plugin(name: str, repo_base: str = DEFAULT_PLUGIN_REPO,
         plugin_name = name[:-3] if name.endswith(".py") else name
         url = f"{repo_base.rstrip('/')}/.wheeljack/plugins/{plugin_name}.py"
 
+    if not url.startswith("https://") and not insecure:
+        raise InstallError("HTTPS is required for plugin installation; use --insecure to override")
+
     try:
         body = _http_get(url)
     except urllib.error.HTTPError as exc:
@@ -1301,27 +1327,28 @@ def uninstall_plugin(name: str, target_dir: Optional[Path] = None, *,
     return True
 
 
-def list_plugins(project_dir: Path, home: Optional[Path] = None) -> List[str]:
+def list_plugins(project_dir: Path, home: Optional[Path] = None,
+                 repo_base: str = DEFAULT_PLUGIN_REPO) -> List[str]:
     """installed vs project vs available (from the repo)."""
     project_dir = Path(project_dir)
     installed = _home_dir() if home is None else Path(home)
     installed = installed / "plugins"
-    sd = installed if installed.is_dir() else None
 
     def _names(d: Optional[Path]) -> List[str]:
         if d is None or not d.is_dir():
             return []
-        return sorted(p.stem for p in d.glob("*.py") if not p.name.startswith("_"))
+        return sorted(p.stem for p in d.glob("*.py")
+                      if not p.name.startswith("_") and p.name != "wheeljack.py")
 
     inst = [p.stem for p in (installed.glob("*.py") if installed.is_dir() else [])
-            if not p.name.startswith("_")]
+            if not p.name.startswith("_") and p.name != "wheeljack.py"]
     proj = _names(project_dir)
     lines = [
         "Installed (~/.wheeljack/plugins):",
         "  " + (", ".join(inst) if inst else "(none)"),
         f"Project ({project_dir}):",
         "  " + (", ".join(proj) if proj else "(none)"),
-        "Available (from %s):" % DEFAULT_PLUGIN_REPO,
+        f"Available (from {repo_base}):",
         "  " + ", ".join(REPO_PLUGINS),
         "",
         "Install one with: python wheeljack.py --install NAME",
@@ -1386,7 +1413,7 @@ def _gate_edit(ctx: ToolContext, file_path: str, action: str) -> str:
     approved = ctx.app.confirm(
         f"\U0001F512 Edit mode is off (-w/--write to enable permanently). "
         f"{action}: {file_path}\nAllow this edit?",
-        default="n") == "y"
+        default="n", timeout=CONFIRM_TIMEOUT) == "y"
     if approved:
         return ""
     return ("[edit blocked: edit mode is off. Re-run with -w/--write "
@@ -1409,7 +1436,7 @@ def _confirm_dangerous_command(ctx: ToolContext, command: str) -> bool:
     approved = ctx.app.confirm(
         f"\u26A0\uFE0F  This command is flagged as {', '.join(reasons)}:\n"
         f"    {command}\nRun it?",
-        default="n") == "y"
+        default="n", timeout=CONFIRM_TIMEOUT) == "y"
     if not approved:
         ctx._declined_commands.append(command)
     return approved
@@ -1697,8 +1724,7 @@ class WheeljackApp:
 
     def __init__(self, config=None) -> None:
         self.core = _core_module()
-        self.config = config if config is not None else SimpleNamespace(
-            model="demo-model", api_base="local")
+        self.config = config if config is not None else Config()
         self.agent = None
         self.tools: Dict[str, tuple] = {}
         self.slash_commands: Dict[str, Callable] = {}
@@ -1747,7 +1773,7 @@ class WheeljackApp:
                     getattr(r, name)(event)
                 except Exception as exc:
                     self.log(f"renderer error: {exc}")
-        for handler in self.observers.get(type(event), ()):
+        for handler in list(self.observers.get(type(event), ())):
             try:
                 handler(event)
             except Exception as exc:
@@ -1755,6 +1781,11 @@ class WheeljackApp:
 
     def on(self, event_type: type, handler: Callable) -> None:
         self.observers.setdefault(event_type, []).append(handler)
+
+    def off(self, event_type: type, handler: Callable) -> None:
+        handlers = self.observers.get(event_type)
+        if handlers and handler in handlers:
+            handlers.remove(handler)
 
     # -- tools / slash ---------------------------------------------------
     def add_tool(self, name: str, spec: dict, handler: Callable) -> None:
@@ -1880,7 +1911,8 @@ class LLMClient:
             raise Exception(f"Empty/unexpected API response: {str(data)[:500]}")
         return LLMResponse(
             choices=data["choices"],
-            usage=data.get("usage", {"prompt_tokens": 0, "completion_tokens": 0}))
+            usage=data.get("usage", {"prompt_tokens": 0, "completion_tokens": 0}),
+            streamed=bool(self.content_streamed))
 
     # -- stream reading --------------------------------------------------
     def _read_stream(self, response) -> Dict:
@@ -1898,9 +1930,13 @@ class LLMClient:
         saw_data = False
         raw_buf: List[bytes] = []
         content_streamed = False
+        cancelled = False
 
         for raw_line in response:
             if self.cancel is not None and self.cancel.is_set():
+                # Cancelled mid-stream: keep whatever the model produced so far
+                # rather than raising, so the caller can persist it.
+                cancelled = True
                 break
             raw_buf.append(raw_line)
             line = raw_line.decode("utf-8", "replace").strip()
@@ -1952,7 +1988,9 @@ class LLMClient:
         self.content_streamed = content_streamed
 
         # Non-streaming fallback: server ignored stream:true (single JSON body).
-        if not saw_data:
+        # Never taken when the turn was cancelled — partial output from the
+        # stream is what the caller wants to keep.
+        if not saw_data and not cancelled:
             text = "".join(r.decode("utf-8", "replace") for r in raw_buf)
             try:
                 data = json.loads(text)
@@ -1968,6 +2006,8 @@ class LLMClient:
         message: Dict[str, Any] = {}
         if content_parts:
             message["content"] = "".join(content_parts)
+        elif cancelled:
+            message["content"] = "(cancelled)"
         if tool_calls_acc:
             message["tool_calls"] = [tool_calls_acc[k] for k in sorted(tool_calls_acc)]
         return {"choices": [{"message": message, "finish_reason": finish_reason}],
@@ -2125,31 +2165,35 @@ class Agent(threading.Thread):
                 self._create_new_session(self._generate_session_name())
 
         self._initialize_system_prompt()
+        self.app.agent = self
         app.on(ReasoningDelta, self._accumulate_reasoning)
 
     # -- thread entry point ----------------------------------------------
     def run(self) -> None:
         app = self.app
-        while not app.quit_requested:
-            try:
-                line = app.steer_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if app.quit_requested:
-                break
-            if not line.strip():
-                continue
-            self._add_user_message(line)
-            app.turn_active = True
-            try:
-                self.run_turn()
-            except Exception as exc:
-                app.log(f"error: {exc}")
-            finally:
-                app.turn_active = False
+        try:
+            while not app.quit_requested:
+                try:
+                    line = app.steer_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if app.quit_requested:
+                    break
+                if not line.strip():
+                    continue
+                self._add_user_message(line)
+                app.turn_active = True
+                try:
+                    self.run_turn()
+                except Exception as exc:
+                    app.log(f"error: {exc}")
+                finally:
+                    app.turn_active = False
+                    self._save_session()
+        finally:
+            app.off(ReasoningDelta, self._accumulate_reasoning)
+            if self.session_context:
                 self._save_session()
-        if self.session_context:
-            self._save_session()
 
     def run_once(self, prompt: str) -> str:
         """Non-interactive mode: run a single prompt and return the answer."""
@@ -2160,8 +2204,20 @@ class Agent(threading.Thread):
             self.run_turn()
         finally:
             app.turn_active = False
+            app.off(ReasoningDelta, self._accumulate_reasoning)
             self._save_session()
         return self.last_answer
+
+    def close(self) -> None:
+        """Detach this agent's observers from the app.
+
+        run_once() detaches when it returns; a long-lived agent (run()) does it
+        on thread exit. Call this for an agent that was never started, so a
+        later agent on the same app is not fed this one's events.
+        """
+        self.app.off(ReasoningDelta, self._accumulate_reasoning)
+        if self.app.agent is self:
+            self.app.agent = None
 
     # -- one turn --------------------------------------------------------
     def run_turn(self) -> None:
@@ -2207,7 +2263,7 @@ class Agent(threading.Thread):
             content = (choice.get("message") or {}).get("content") or ""
             if not content:
                 content = "(no response)"
-            self.last_streamed = self.llm.content_streamed
+            self.last_streamed = response.streamed
             self.last_answer = content
             self.messages.append(Message(
                 role="assistant", content=content,
@@ -2285,8 +2341,12 @@ class Agent(threading.Thread):
         tool_calls = []
         if response.choices:
             choice = response.choices[0]
-            if choice.get("finish_reason") == "tool_calls":
-                for tc in choice.get("message", {}).get("tool_calls", []):
+            # Don't require finish_reason == "tool_calls": some servers send the
+            # calls with "stop" or omit the field, and dropping them silently
+            # would turn a tool round into a final answer.
+            raw_calls = choice.get("message", {}).get("tool_calls", [])
+            for tc in raw_calls or []:
+                if isinstance(tc, dict) and "id" in tc and "function" in tc:
                     tool_calls.append(ToolCall(id=tc["id"], function=tc["function"]))
         return tool_calls
 
@@ -2300,7 +2360,8 @@ class Agent(threading.Thread):
                                      timestamp=datetime.now().isoformat()))
 
     def _accumulate_reasoning(self, event: ReasoningDelta) -> None:
-        self.reasoning_text += event.text
+        if getattr(self.app, "agent", None) is self:
+            self.reasoning_text += event.text
 
     # -- sessions --------------------------------------------------------
     @staticmethod
@@ -2349,6 +2410,12 @@ class Agent(threading.Thread):
                 content = msg_data.get("content", "")
                 if role == "system":
                     continue  # a fresh system prompt is added when the agent starts
+                raw_calls = msg_data.get("tool_calls") or []
+                tool_calls = [
+                    ToolCall(id=c.get("id", ""), type=c.get("type", "function"),
+                             function=c.get("function", {}))
+                    for c in raw_calls if isinstance(c, dict) and c.get("function")
+                ]
                 if role == "tool":
                     self.messages.append(Message(
                         role="tool", content=content,
@@ -2357,7 +2424,7 @@ class Agent(threading.Thread):
                         timestamp=msg_data.get("timestamp")))
                 else:
                     self.messages.append(Message(
-                        role=role, content=content,
+                        role=role, content=content, tool_calls=tool_calls or None,
                         timestamp=msg_data.get("timestamp")))
         self.app.log(f"Loaded session '{self.session_context.name}' "
                      f"({len(saved_messages)} previous messages, saved on quit)")
@@ -2401,7 +2468,13 @@ class Agent(threading.Thread):
             "messages": [
                 {"role": m.role, "content": m.content,
                  "timestamp": m.timestamp or datetime.now().isoformat(),
-                 "tool_call_id": m.tool_call_id, "name": m.name}
+                 "tool_call_id": m.tool_call_id, "name": m.name,
+                 # Kept so a resumed conversation replays a well-formed
+                 # assistant tool_call block; without it the tool results that
+                 # follow have no owner and the API rejects the request.
+                 "tool_calls": ([{"id": tc.id, "type": tc.type,
+                                  "function": tc.function} for tc in m.tool_calls]
+                                if m.tool_calls else None)}
                 for m in self.messages
             ],
         }
@@ -2454,8 +2527,11 @@ class Agent(threading.Thread):
         if not text:
             return ""
         if len(text) > self.config.max_agents_md_chars:
+            dropped = len(text) - self.config.max_agents_md_chars
             text = (text[:self.config.max_agents_md_chars].rstrip()
-                    + "\n\n... [AGENTS.md truncated]")
+                    + f"\n\n... [AGENTS.md truncated at "
+                      f"{self.config.max_agents_md_chars} characters; "
+                      f"{dropped} more omitted]")
         return (f"Project instructions from {self.agents_md_path} (AGENTS.md — "
                 f"follow these; they take precedence for this project):\n\n{text}")
 
@@ -2562,7 +2638,7 @@ class DemoAgent(threading.Thread):
 
             if not app.cancel.is_set():
                 ok = app.confirm(
-                    "Run 'rm -rf /tmp/demo-scratch'?", default="n") == "y"
+                    "Run 'rm -rf /tmp/demo-scratch'?", default="n", timeout=1.0) == "y"
                 app.emit(ToolCallStarted(
                     "2", "run_shell", {"cmd": "rm -rf /tmp/demo-scratch"}))
                 if self._wait(0.3):
@@ -2685,16 +2761,16 @@ def main() -> None:
     home = ensure_home()
 
     # -- pre-agent shell commands (no renderer exists yet) ----------------
+    repo = args.plugin_repo or os.getenv("WHEELJACK_PLUGIN_REPO") or DEFAULT_PLUGIN_REPO
     if args.session == "__list__":
         for line in _sessions_table(home / "sessions"):
             print(line)
         return
     if args.list_plugins:
-        for line in list_plugins(Path(args.plugins), home=home):
+        for line in list_plugins(Path(args.plugins), home=home, repo_base=repo):
             print(line)
         return
     if args.install:
-        repo = args.plugin_repo or os.getenv("WHEELJACK_PLUGIN_REPO") or DEFAULT_PLUGIN_REPO
         try:
             target = install_plugin(args.install, repo_base=repo,
                                     target_dir=home / "plugins",
@@ -2770,7 +2846,7 @@ def main() -> None:
         except Exception as exc:
             print(f"error: {exc}")
             sys.exit(1)
-        if answer and answer != "(no response)" and not agent.llm.content_streamed:
+        if answer and answer != "(no response)" and not agent.last_streamed:
             _render_answer(answer, config)
         return
 
