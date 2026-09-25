@@ -324,6 +324,134 @@ class TestSlashDispatch(unittest.TestCase):
                 second.close()
 
 
+class TestHistoryCommand(unittest.TestCase):
+    """`/history` shows the whole conversation; /context only the last 20."""
+
+    def _app(self, sdir, session_enabled=True, **kw):
+        cfg = wj.Config(cwd=sdir, sessions_dir=sdir,
+                        session_enabled=session_enabled, **kw)
+        app = wj.WheeljackApp(cfg)
+        # RecordingRenderer (not QuietRenderer): /history talks through app.log,
+        # which becomes a LogMessage event once a renderer is attached.
+        self.rec = RecordingRenderer(app)
+        app._renderer = self.rec
+        return app, cfg
+
+    def test_history_shows_every_turn_not_just_the_recent_window(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg = self._app(sdir)
+            agent = wj.Agent(app, cfg, sdir, session_name="long-chat")
+            for i in range(30):
+                agent._add_user_message(f"question {i}")
+                agent.messages.append(wj.Message(
+                    role="assistant", content=f"answer {i}",
+                    timestamp=datetime.now().isoformat()))
+            agent._save_session()
+
+            app.submit_line("/history")
+            text = self.rec.text()
+            self.assertIn("question 0", text)     # dropped by /context's window
+            self.assertIn("answer 29", text)
+            self.assertIn("long-chat", text)
+            agent.close()
+
+    def test_history_reads_the_saved_file_not_the_trimmed_context(self):
+        """Turns evicted from the live context must still appear: the session
+        file is the record of the conversation, not the trimmed message list."""
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg = self._app(sdir)
+            agent = wj.Agent(app, cfg, sdir, session_name="trimmed")
+            agent._add_user_message("survives the trim")
+            agent._save_session()
+            # Simulate context trimming dropping the oldest turns.
+            agent.messages = [m for m in agent.messages if m.role == "system"]
+
+            app.submit_line("/history")
+            self.assertIn("survives the trim", self.rec.text())
+            agent.close()
+
+    def test_history_labels_tool_calls_and_previews_results(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg = self._app(sdir)
+            agent = wj.Agent(app, cfg, sdir, session_name="tools")
+            call = wj.ToolCall("call_1", {"name": "run_shell",
+                                          "arguments": '{"command": "df -h"}'})
+            agent.messages.append(wj.Message(
+                role="assistant", content="", tool_calls=[call],
+                timestamp=datetime.now().isoformat()))
+            agent._add_tool_response(call, "x" * 5000)
+            agent._save_session()
+
+            app.submit_line("/history")
+            text = self.rec.text()
+            self.assertIn("(called run_shell)", text)
+            self.assertIn("tool:run_shell", text)
+            self.assertIn("more chars", text)     # long output is previewed
+            self.assertNotIn("x" * 5000, text)
+            agent.close()
+
+    def test_history_named_session_shows_that_conversation(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg = self._app(sdir)
+            other = wj.Agent(app, cfg, sdir, session_name="other-task")
+            other._add_user_message("a different conversation")
+            other._save_session()
+            other.close()
+
+            app.submit_line("/history other-task")
+            text = self.rec.text()
+            self.assertIn("a different conversation", text)
+            self.assertIn("other-task", text)
+
+    def test_history_unknown_session_name_explains(self):
+        with tempfile.TemporaryDirectory() as td:
+            app, _cfg = self._app(Path(td))
+            app.submit_line("/history nope")
+            text = self.rec.text()
+            self.assertIn("no saved session named 'nope'", text)
+            self.assertIn("/sessions", text)
+
+    def test_history_without_a_conversation_says_so(self):
+        app = wj.WheeljackApp()
+        app.submit_line("/history")
+        self.assertTrue(any("no conversation yet" in m for m in app._log))
+
+    def test_history_is_a_registered_builtin(self):
+        app = wj.WheeljackApp()
+        self.assertIn("history", app.slash_commands)
+        app.submit_line("/help")
+        self.assertTrue(any("/history" in m for m in app._log))
+
+    def test_history_works_with_sessions_disabled(self):
+        """-s means nothing is saved, but the live conversation is still the
+        conversation — /history must show it rather than claim there is none."""
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, _cfg = self._app(sdir, session_enabled=False)
+            agent = wj.Agent(app, app.config, sdir)
+            agent._add_user_message("unsaved by design")
+            app.submit_line("/history")
+            text = self.rec.text()
+            self.assertIn("unsaved by design", text)
+            self.assertNotIn("session '", text)   # no session metadata to show
+            agent.close()
+
+    def test_mid_turn_history_falls_back_to_the_live_messages(self):
+        """Before the first save there is no session file to read."""
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg = self._app(sdir)
+            agent = wj.Agent(app, cfg, sdir, session_name="unsaved")
+            agent._add_user_message("never saved yet")
+            app.submit_line("/history")
+            self.assertIn("never saved yet", self.rec.text())
+            agent.close()
+
+
 # ---------------------------------------------------------------------------
 # Plugin loader
 # ---------------------------------------------------------------------------
@@ -525,6 +653,246 @@ class TestPipedIntegration(unittest.TestCase):
         self.assertNotIn("\x1b", out)
         self.assertNotIn(">> ", out)
         self.assertIn("Wheeljack commands", out)
+
+
+class TestContextStats(unittest.TestCase):
+    """/context reports sizes and shares instead of reprinting the transcript."""
+
+    def _agent(self, sdir):
+        cfg = wj.Config(cwd=sdir, sessions_dir=sdir, session_enabled=True)
+        app = wj.WheeljackApp(cfg)
+        self.rec = RecordingRenderer(app)
+        app._renderer = self.rec
+        agent = wj.Agent(app, cfg, sdir, session_name="stats")
+        return app, cfg, agent
+
+    def test_trim_cap_matches_the_constant_the_stats_promise(self):
+        """The trimmed-count message names the window size; pin it to the real
+        behaviour so the two cannot drift apart."""
+        msgs = [wj.Message(role="system", content="sys")]
+        msgs += [wj.Message(role="user", content=f"m{i}") for i in range(150)]
+        kept = wj.LLMClient(wj.Config(), lambda e: None)._trim_messages(msgs)
+        # The cap counts tail messages and the system prompt is re-inserted on
+        # top, so a trimmed request carries one more than the cap.
+        self.assertEqual(len(kept), wj.MAX_CONTEXT_MESSAGES + 1)
+        self.assertEqual(kept[0].role, "system")
+        self.assertNotIn(kept[1], msgs[1:-wj.MAX_CONTEXT_MESSAGES])
+
+    def test_reports_system_prompt_size_and_share(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg, agent = self._agent(sdir)
+            app.submit_line("/context")
+            text = self.rec.text()
+            self.assertIn("context window:", text)
+            self.assertIn("system prompt", text)
+            self.assertIn("conversation", text)
+            self.assertIn("% of", text)
+            agent.close()
+
+    def test_percentage_uses_the_declared_window(self):
+        """Same context, two declared windows: the window is the denominator."""
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg, agent = self._agent(sdir)
+            agent._add_user_message("hello there")
+
+            def used_pct(window):
+                cfg.context_window = window
+                app.submit_line("/context")
+                line = [l for l in self.rec.text().splitlines()
+                        if "of window" in l][-1]
+                # Pick the field that IS a percentage; the token count before
+                # it changes width with thousands grouping.
+                return float([f for f in line.split() if f.endswith("%")][0][:-1])
+
+            small, large = used_pct(1000), used_pct(100000)
+            # Percentages are never clamped; the warning line covers overflow.
+            self.assertGreater(small, large)
+            self.assertLess(small, 100.0)
+            self.assertLess(large, 1.0)
+            agent.close()
+
+    def test_reports_the_tool_schema_block(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg, agent = self._agent(sdir)
+            wj.register_core_tools(app, cfg, sdir)
+            app.submit_line("/context")
+            text = self.rec.text()
+            self.assertIn("tool schemas", text)
+            # The schema block is real output, not a placeholder.
+            self.assertGreater(wj._tool_schema_chars(app), 0)
+            agent.close()
+
+    def test_warns_when_the_context_exceeds_the_window(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg, agent = self._agent(sdir)
+            agent._add_user_message("x" * 20_000)
+            cfg.context_window = 10          # 40 chars
+            app.submit_line("/context")
+            self.assertIn("over the declared window", self.rec.text())
+            agent.close()
+
+    def test_no_warning_when_it_fits(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg, agent = self._agent(sdir)
+            cfg.context_window = 100_000
+            app.submit_line("/context")
+            self.assertNotIn("over the declared window", self.rec.text())
+            agent.close()
+
+    def test_reports_the_trimmed_count_when_the_cap_bites(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg, agent = self._agent(sdir)
+            for i in range(130):
+                agent._add_user_message(f"m{i}")
+            app.submit_line("/context")
+            text = self.rec.text()
+            self.assertIn("trimmed:", text)
+            self.assertIn("30 oldest", text)      # 131 live -> 101 sent
+            self.assertIn(f"last {wj.MAX_CONTEXT_MESSAGES} recent messages", text)
+            agent.close()
+
+    def test_no_trim_line_when_nothing_is_dropped(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg, agent = self._agent(sdir)
+            agent._add_user_message("short")
+            app.submit_line("/context")
+            self.assertNotIn("trimmed:", self.rec.text())
+            agent.close()
+
+    def test_context_full_appends_the_transcript(self):
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg, agent = self._agent(sdir)
+            agent._add_user_message("findable text")
+            app.submit_line("/context")
+            stats_only = self.rec.text()
+            self.assertNotIn("findable text", stats_only)
+            app.submit_line("/context full")
+            with_transcript = self.rec.text()
+            self.assertIn("findable text", with_transcript)
+            self.assertIn("messages:", with_transcript)
+            agent.close()
+
+    def test_no_conversation_says_so(self):
+        app = wj.WheeljackApp()
+        self.rec = RecordingRenderer(app)
+        app._renderer = self.rec
+        app.submit_line("/context")
+        self.assertIn("no conversation yet", self.rec.text())
+
+    def test_total_tokens_stays_attributed_to_the_session(self):
+        """The stats view must not claim a real token count it cannot know."""
+        with tempfile.TemporaryDirectory() as td:
+            sdir = Path(td)
+            app, cfg, agent = self._agent(sdir)
+            agent.total_tokens_used = 4242
+            app.submit_line("/context")
+            self.assertIn("4,242 tokens used in total", self.rec.text())
+            agent.close()
+
+
+class TestHistoryCli(unittest.TestCase):
+    """--history is the non-interactive face of /history: print and exit."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name) / "wh"
+        # _home_dir() honours WHEELJACK_HOME, so the run never touches the
+        # developer's real ~/.wheeljack.
+        self.env = dict(os.environ, WHEELJACK_HOME=str(self.home))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run(self, args, stdin_bytes=b""):
+        return subprocess.run(
+            [sys.executable, "wheeljack.py", *args],
+            cwd=REPO, env=self.env, input=stdin_bytes,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=30)
+
+    def _write_session(self, name, sid, messages, mtime=None):
+        sdir = self.home / "sessions"
+        sdir.mkdir(parents=True, exist_ok=True)
+        path = sdir / f"{sid}.json"
+        path.write_text(json.dumps({
+            "context": {"session_id": sid, "name": name,
+                        "created_at": "2026-01-02T03:04:05",
+                        "last_accessed": "2026-01-02T05:06:07",
+                        "message_count": len(messages)},
+            "conversation_summary": "", "total_tokens": 0,
+            "messages": messages,
+        }), encoding="utf-8")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_history_by_name_prints_the_conversation(self):
+        self._write_session("prod-setup", "abc123", [
+            {"role": "user", "content": "restart nginx"},
+            {"role": "assistant", "content": "restarted it"},
+        ])
+        p = self._run(["--history", "prod-setup"])
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("restart nginx", out)
+        self.assertIn("restarted it", out)
+        self.assertIn("prod-setup", out)
+        self.assertIn("2 entries", out)
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("conversation context:", out)   # no longer a transcript
+
+    def test_bare_history_shows_the_most_recently_used_session(self):
+        self._write_session("older", "aaa111",
+                            [{"role": "user", "content": "old words"}], mtime=1000)
+        self._write_session("newer", "bbb222",
+                            [{"role": "user", "content": "new words"}], mtime=2000)
+        p = self._run(["--history"])
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("new words", out)
+        self.assertNotIn("old words", out)
+
+    def test_history_accepts_a_session_id(self):
+        self._write_session("byid", "deadbeef", [
+            {"role": "user", "content": "found by id"}])
+        p = self._run(["--history", "deadbeef"])
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("found by id", out)
+
+    def test_history_unknown_name_exits_nonzero(self):
+        self._write_session("known", "ccc333",
+                            [{"role": "user", "content": "hi"}])
+        p = self._run(["--history", "nope"])
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("no saved conversation matching 'nope'", out)
+
+    def test_bare_history_with_no_sessions_exits_nonzero(self):
+        p = self._run(["--history"])
+        out = p.stdout.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("no saved conversations", out)
+
+    def test_history_never_starts_a_conversation(self):
+        """It must print and exit — no session gets created as a side effect."""
+        self._write_session("only", "ddd444",
+                            [{"role": "user", "content": "just this"}])
+        before = sorted((self.home / "sessions").glob("*.json"))
+        p = self._run(["--history", "only"])
+        self.assertEqual(p.returncode, 0, p.stdout.decode("utf-8", "replace"))
+        self.assertEqual(sorted((self.home / "sessions").glob("*.json")), before)
+
+    def test_history_appears_in_help(self):
+        p = self._run(["--help"])
+        self.assertIn("--history", p.stdout.decode("utf-8", "replace"))
 
 
 # ---------------------------------------------------------------------------

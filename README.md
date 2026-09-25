@@ -20,7 +20,8 @@ It's optimized for **local models** (Ollama / llama.cpp): lightweight context, n
 - **Safety prompts**: destructive commands (`rm -rf`, `mkfs`, `dd`, ...) and anything using `sudo` ask for y/N approval before running; declined commands stay blocked for the session
 - **Local-first**: defaults to `http://localhost:11434/v1` (Ollama) with no API key required
 - **Any OpenAI-compatible backend**: Ollama, llama.cpp, OpenRouter, OpenAI, vLLM, etc.
-- **Persistent sessions**: named conversations (e.g. `daring-horizon`) auto-saved and resumable across directories
+- **Persistent sessions**: named conversations (e.g. `daring-horizon`) auto-saved and resumable across directories — read one back with `--history NAME` (non-interactive) or `/history` inside a session
+- **Context accounting**: `/context` shows how much of the declared window the next request will use — system prompt vs conversation vs tool schemas, per-role sizes, and the trimmed-message count (set the window with `--context-window`)
 - **Project instructions (`AGENTS.md`)**: the nearest `AGENTS.md` from the working directory upward is injected into the system prompt; `--agents-md PATH` overrides with a specific file and `--agents-md none` disables it
 - **Non-interactive mode**: `-p "prompt"` runs a single prompt and exits — scriptable from cron, CI, or other tools
 - **Markdown rendering**: non-interactive answers are rendered with `glow` when it's installed and stdout is a TTY (`-x`/`--no-format` disables)
@@ -81,6 +82,10 @@ python blaster.py --cwd /srv/myapp
 python blaster.py --session prod-setup
 python blaster.py --session
 
+# Read a saved conversation back (bare --history = most recently used)
+python blaster.py --history prod-setup
+python blaster.py --history
+
 # Non-interactive: run one prompt and exit (scriptable)
 python blaster.py -p "check disk usage and report the top 5 largest dirs"
 
@@ -105,6 +110,8 @@ python blaster.py -w -p "add a docstring to utils.py and fix the typo in config.
 | `-t`/`--timeout` | 300 | LLM request timeout in seconds (per socket read; streaming keeps it alive during generation) |
 | `-w`/`--write` | off | Enable edit mode: allow `write_file`/`edit_file` to modify files (blocked by default for safety) |
 | `--session` | auto (random name) | Session name to load/resume; bare `--session` lists sessions |
+| `--history` | — | Print a saved conversation and exit; bare `--history` prints the most recently used one (name or session id) |
+| `--context-window` | 32768 | Model context window in tokens, used as `/context`'s denominator (also settable in `config.json`); an estimate only, since the endpoint never reports its real window |
 | `-x`/`--no-format` | off | Disable `glow` markdown rendering in non-interactive mode |
 | `-s`/`--no-session` | off | Disable sessions entirely (no load, create, or save) |
 | `--agents-md` | auto-discover | `AGENTS.md` file to load (`--agents-md PATH` for a specific file, `--agents-md none` to disable) |
@@ -209,7 +216,9 @@ On startup Blaster looks for an `AGENTS.md` file — the convention for project-
 
 ## Sessions
 
-Conversations auto-save after every turn to `~/.blaster/sessions/<session_id>.json`. Each session gets a unique id (the filename) and a human-friendly name — auto-generated as an adjective-noun pair (e.g. `daring-horizon`) unless you pass `--session NAME`. Sessions identify tasks, not directories: `--session` matches by name across every saved session, so you can resume one from any working directory. Bare `python blaster.py --session` lists saved sessions (name, id, message count, created/last-used). On resume the last 100 messages are restored and shown as a recap, and the per-turn context window is capped at 100 messages to protect the model's context. Use `-s`/`--no-session` to skip all session loading and saving.
+Conversations auto-save after every turn to `~/.blaster/sessions/<session_id>.json`. Each session gets a unique id (the filename) and a human-friendly name — auto-generated as an adjective-noun pair (e.g. `daring-horizon`) unless you pass `--session NAME`. Sessions identify tasks, not directories: `--session` matches by name across every saved session, so you can resume one from any working directory. Bare `python blaster.py --session` lists saved sessions (name, id, message count, created/last-used). On resume the last 100 messages are restored and shown as a recap, and the per-turn context window is capped at 100 messages to protect the model's context. To read a conversation back without starting a new turn, use `python blaster.py --history [NAME]` (bare `--history` picks the most recently used session; a session id works as well as a name) — it prints and exits. Inside a session, `/history` prints the whole conversation and `/history NAME` another saved one. `/context` reports what the agent is carrying instead of reprinting it: the declared window, estimated tokens used and the resulting percentage, system-prompt size and share, conversation size before/after the 100-message trim, the tool-schema block, and a per-role breakdown — `/context full` appends the transcript. Every figure is a `chars / 4` estimate (the API never sends a pre-request token count), percentages are shares of the declared window and are never clamped, and the only real token figure shown is the session's cumulative total, which core accumulates from the `usage` field of each response. Use `-s`/`--no-session` to skip all session loading and saving.
+
+A printed transcript is numbered, labels each turn (`you` / `wheeljack`), shows a tool round as `(called NAME)` plus a one-line `tool:NAME` preview of its output, and always reads the saved file — so turns already trimmed out of the model's context still appear.
 
 ## Architecture
 

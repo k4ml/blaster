@@ -29,7 +29,14 @@ Usage:
     python wheeljack.py --list-plugins        # installed vs project vs available
     python wheeljack.py --session my-task     # resume/create a named session
     python wheeljack.py --session             # list saved sessions
+    python wheeljack.py --history [NAME]      # print a saved conversation and exit
     python wheeljack.py --demo                # fake agent, no endpoint (TUI smoke test)
+
+Commands (/help inside a session):
+    /history [NAME]  print the whole conversation (or a saved session)
+    /context [full]  context size stats: tokens used vs the declared window
+                     (--context-window), system prompt vs conversation vs
+                     tool schemas, and how many messages the trim drops
 """
 from __future__ import annotations
 
@@ -222,6 +229,10 @@ class Config:
     tool_parallel_reads: bool = True    # --no-parallel disables
     parallel_workers: int = 8           # bounded read-only thread pool
     show_reasoning: bool = False        # --show-reasoning streams reasoning inline
+    # Denominator for /context's percentage. Nothing in the OpenAI-compatible
+    # API reports the model's real window, so this is the number the user
+    # declares (--context-window N, config.json, or this default).
+    context_window: int = 32768
     plugin_repo: str = os.getenv("WHEELJACK_PLUGIN_REPO", DEFAULT_PLUGIN_REPO)
 
 
@@ -1003,6 +1014,295 @@ class NonInteractiveRenderer(StdioRenderer):
 
 
 # --------------------------------------------------------------------------
+# Conversation transcript — the whole history, shared by /history
+# (interactive) and --history (non-interactive). /context deliberately shows a
+# short window; this shows every turn.
+# --------------------------------------------------------------------------
+
+# One tool result can be 40KB of shell output, so the transcript previews it on
+# a single line and keeps the conversation around it readable.
+TRANSCRIPT_TOOL_PREVIEW = 200
+
+# The per-request window of recent messages the agent keeps (see
+# LLMClient._trim_messages). Named here so /context can report the same number
+# it trims by instead of restating it.
+MAX_CONTEXT_MESSAGES = 100
+
+
+def _message_view(message) -> Optional[Dict[str, Any]]:
+    """Normalize a live Message or a saved session dict into a transcript row.
+
+    Returns None for rows that are not conversation: the system prompt, the
+    "(no response)" filler, and the loop's own "(system) ..." nudges.
+    """
+    if isinstance(message, dict):
+        role = message.get("role", "")
+        content = message.get("content") or ""
+        name = message.get("name")
+        calls = [(c.get("function") or {}).get("name", "")
+                 for c in (message.get("tool_calls") or []) if isinstance(c, dict)]
+    else:
+        role = getattr(message, "role", "")
+        content = getattr(message, "content", "") or ""
+        name = getattr(message, "name", None)
+        calls = [tc.function.get("name", "")
+                 for tc in (getattr(message, "tool_calls", None) or [])]
+    if role == "system":
+        return None
+    text = content.strip()
+    if not text or text == "(no response)" or text.startswith("(system)"):
+        # An assistant tool-call block carries no text but is still a real
+        # turn; everything else that lands here is filler.
+        if not (role == "assistant" and any(calls)):
+            return None
+    return {"role": role, "content": text, "name": name,
+            "calls": [c for c in calls if c]}
+
+
+def _transcript_lines(rows: List[Dict[str, Any]]) -> List[str]:
+    """Render transcript rows as indented, numbered lines.
+
+    User/assistant text is kept whole (continuation lines stay aligned); a tool
+    call is one line and a tool result a one-line preview.
+    """
+    lines: List[str] = []
+    for i, row in enumerate(rows, 1):
+        if row["role"] == "tool":
+            preview = _truncate(" ".join(row["content"].split()),
+                                TRANSCRIPT_TOOL_PREVIEW)
+            lines.append(f"  [{i}] tool:{row['name'] or '?'}: {preview}")
+            continue
+        who = "you" if row["role"] == "user" else "wheeljack"
+        if not row["content"] and row["calls"]:
+            lines.append(f"  [{i}] {who}: (called {', '.join(row['calls'])})")
+            continue
+        body = row["content"].split("\n")
+        lines.append(f"  [{i}] {who}: {body[0]}")
+        lines.extend(f"        {extra}" for extra in body[1:])
+    return lines
+
+
+def history_lines(rows: List[Dict[str, Any]], *,
+                  title: str = "conversation history",
+                  meta: Optional[Dict[str, str]] = None) -> List[str]:
+    """Format a whole conversation: a header, then every turn."""
+    # Counts entries as shown, so the header agrees with the highest [n] label
+    # (a tool round is a user turn, a tool-call line and a result line).
+    count = len(rows)
+    noun = "entry" if count == 1 else "entries"
+    head = f"{title} — {count} {noun}"
+    if meta and meta.get("name"):
+        head += f" (session '{meta['name']}', id {meta.get('session_id', '?')})"
+    lines = [head]
+    if meta and (meta.get("created") or meta.get("last_used")):
+        lines.append(f"  created {meta.get('created', '?')} · "
+                     f"last used {meta.get('last_used', '?')}")
+    if not rows:
+        lines.append("  (nothing said yet)")
+        return lines
+    lines.append("")
+    lines.extend(_transcript_lines(rows))
+    return lines
+
+
+def _saved_rows_for(sessions_dir, session_id: str) -> List[Dict[str, Any]]:
+    """Transcript rows from a live session's own file ([] when unreadable)."""
+    if not sessions_dir or not session_id:
+        return []
+    try:
+        data = json.loads((Path(sessions_dir) / f"{session_id}.json")
+                          .read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return [v for v in (_message_view(m) for m in data.get("messages", [])) if v]
+
+
+def _message_text(message) -> str:
+    """Everything that would be sent for a message: its text plus any
+    serialized tool-call arguments (which ride in the request too)."""
+    text = getattr(message, "content", "") or ""
+    extra = []
+    for tc in (getattr(message, "tool_calls", None) or []):
+        extra.append(tc.function.get("name", ""))
+        extra.append(str(tc.function.get("arguments", "")))
+    return text + ("\n" + "\n".join(extra) if extra else "")
+
+
+def _count_estimates(agent) -> Dict[str, int]:
+    """Per-role character counts over an agent's message list."""
+    counts = {"system": 0, "user": 0, "assistant": 0, "tool": 0, "total": 0}
+    for message in getattr(agent, "messages", []):
+        n = len(_message_text(message))
+        counts[message.role] = counts.get(message.role, 0) + n
+        counts["total"] += n
+    return counts
+
+
+def _tool_schema_chars(app) -> int:
+    """Characters of tool schema that ride along with a tool-enabled request."""
+    try:
+        return len(json.dumps(_tools_schema(app)))
+    except Exception:
+        return 0
+
+
+def _fmt_chars(n: int) -> str:
+    return f"{n:,}"
+
+
+def _pct(part: int, whole: int) -> str:
+    if whole <= 0:
+        return "n/a"
+    return f"{100.0 * part / whole:.1f}%"
+
+
+def _stat_line(label: str, part: int, whole: int, detail: str = "",
+               width: int = 16) -> str:
+    line = f"  {label:<{width}}{_pct(part, whole):>6} of {_fmt_chars(whole):>9} chars"
+    return f"{line}  {detail}" if detail else line
+
+
+def context_lines(agent, app, *, window: int) -> List[str]:
+    """Size statistics for the next request's context.
+
+    Everything is an estimate from character counts (chars / 4), not the
+    server's tokenizer: core never sees a real token count before the request,
+    and after it the only figure the API returns is cumulative session usage.
+    A percentage needs a denominator, so `window` is the window the user
+    declared (--context-window / config.json) — it is not discovered from the
+    endpoint.
+    """
+    if agent is None:
+        return ["no conversation yet"]
+
+    window = max(int(window or 0), 0)
+    counts = _count_estimates(agent)
+    history = agent.llm._trim_messages(agent.messages)
+    trimmed = len(history) < len(agent.messages)
+    trimmed_chars = sum(len(_message_text(m)) for m in history)
+    schema_chars = _tool_schema_chars(app) if agent.llm._conversation_needs_tools(history) else 0
+
+    system_chars = counts["system"]
+    conv_chars = counts["total"] - system_chars
+    request_chars = trimmed_chars + schema_chars
+    window_chars = window * 4          # ~4 chars per token
+    used_tokens = request_chars // 4
+
+    conv_msgs = [m for m in (getattr(agent, "messages", [])[1:])
+                 if _message_view(m) is not None]
+    session_tokens = getattr(agent, "total_tokens_used", 0)
+
+    lines = ["context window:"]
+    lines.append(f"  total window     {_fmt_chars(window):>14} tokens"
+                 f"  (~{_fmt_chars(window_chars)} chars) — declared")
+    lines.append(f"  estimated use    {used_tokens:>14,} tokens"
+                 f"  {_pct(request_chars, window_chars)} of window")
+    if request_chars > window_chars:
+        lines.append(f"  ⚠ over the declared window by "
+                     f"{_fmt_chars(request_chars - window_chars)} chars "
+                     f"(~{(request_chars - window_chars) // 4:,} tokens)")
+
+    lines.append("")
+    lines.append("full message list (before trimming):")
+    lines.append(_stat_line("system prompt", system_chars, counts["total"]))
+    lines.append(_stat_line("conversation", conv_chars, counts["total"]))
+    lines.append(f"  {'':<16}{_fmt_chars(counts['total']):>6} chars, "
+                 f"{len(getattr(agent, 'messages', []))} messages"
+                 f"  (~{counts['total'] // 4:,} tokens)")
+
+    lines.append("")
+    lines.append("next request:")
+    lines.append(_stat_line("system prompt", system_chars, request_chars))
+    lines.append(_stat_line("conversation", trimmed_chars - system_chars,
+                            request_chars))
+    if schema_chars:
+        lines.append(_stat_line("tool schemas", schema_chars, request_chars))
+    lines.append(f"  {'':<16}{_fmt_chars(request_chars):>6} chars, "
+                 f"{len(history)} messages  (~{used_tokens:,} tokens)")
+    if trimmed:
+        dropped = len(agent.messages) - len(history)
+        lines.append(f"  trimmed: {dropped} oldest message(s) dropped; the window "
+                     f"keeps the last {MAX_CONTEXT_MESSAGES} recent messages "
+                     f"(plus the system prompt)")
+
+    lines.append("")
+    lines.append("by role (next request):")
+    for role in ("user", "assistant", "tool"):
+        chars = sum(len(_message_text(m)) for m in history if m.role == role)
+        lines.append(f"  {role:<16}{_pct(chars, request_chars):>6}"
+                     f" of {_fmt_chars(request_chars):>9} chars")
+
+    lines.append("")
+    session = getattr(agent, "session_context", None)
+    n_msgs = len(getattr(agent, "messages", []))
+    lines.append(f"session: {len(conv_msgs)} conversation messages + "
+                 f"{n_msgs - len(conv_msgs)} system/filler, "
+                 f"~{counts['total'] // 4:,} tokens in context, "
+                 f"{session_tokens:,} tokens used in total")
+    if session is not None:
+        lines.append(f"  name {session.name} · id {session.session_id} · "
+                     f"created {(session.created_at or '?')[:10]}")
+    return lines
+
+
+def _cmd_context(app: "WheeljackApp", args: str) -> None:
+    """Size statistics for the context the agent is carrying.
+
+    `--full` (or any argument) appends the transcript, so the numbers can be
+    traced back to the messages that produced them.
+    """
+    agent = app.agent
+    if agent is None:
+        app.log("no conversation yet")
+        return
+    window = getattr(app.config, "context_window", 32768)
+    lines = context_lines(agent, app, window=window)
+    if args.strip():
+        rows = [v for v in (_message_view(m)
+                            for m in getattr(agent, "messages", [])) if v]
+        lines.append("")
+        lines.append("messages:")
+        lines.extend(_transcript_lines(rows))
+    app.log("\n".join(lines))
+
+
+def _find_session_file(sessions_dir: Path, name: str, *,
+                       match_id: bool = False) -> Optional[Tuple[Path, dict]]:
+    """Find a saved session by its human name (or, optionally, its id/filename).
+
+    Most recently used first, so a name shared by two files resolves to the one
+    the user touched last.
+    """
+    sessions_dir = Path(sessions_dir)
+    try:
+        files = sorted(sessions_dir.glob("*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for session_file in files:
+        try:
+            data = json.loads(session_file.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        ctx = data.get("context", {})
+        saved_name = ctx.get("name", ctx.get("session_id", session_file.stem))
+        if saved_name == name or (match_id and session_file.stem == name):
+            return session_file, data
+    return None
+
+
+def _session_history_lines(path: Path, data: dict) -> List[str]:
+    """Whole-conversation transcript for one saved session file."""
+    ctx = data.get("context", {})
+    rows = [v for v in (_message_view(m) for m in data.get("messages", [])) if v]
+    return history_lines(rows, meta={
+        "name": ctx.get("name", path.stem),
+        "session_id": ctx.get("session_id", path.stem),
+        "created": (ctx.get("created_at") or "")[:10],
+        "last_used": (ctx.get("last_accessed") or "")[:10]})
+
+
+# --------------------------------------------------------------------------
 # Slash commands
 # --------------------------------------------------------------------------
 
@@ -1026,7 +1326,7 @@ def dispatch_slash(app: "WheeljackApp", text: str) -> bool:
 
 
 _BUILTIN_COMMANDS = ("help", "quit", "exit", "tools", "plugins", "model",
-                     "context", "sessions", "reasoning")
+                     "context", "history", "sessions", "reasoning")
 
 
 def _cmd_help(app: "WheeljackApp", args: str) -> None:
@@ -1037,7 +1337,8 @@ def _cmd_help(app: "WheeljackApp", args: str) -> None:
         "  /tools           list registered tools",
         "  /plugins         list loaded plugins",
         "  /model [NAME]    show or set the model",
-        "  /context         show recent conversation",
+        "  /context [full]  context size stats (add 'full' for the transcript)",
+        "  /history [NAME]  show the whole conversation (or a saved session)",
         "  /sessions        list saved sessions",
         "  /reasoning       show the captured reasoning block",
     ]
@@ -1066,27 +1367,46 @@ def _cmd_model(app: "WheeljackApp", args: str) -> None:
     else:
         app.log(f"model: {app.config.model}")
 
+def _cmd_history(app: "WheeljackApp", args: str) -> None:
+    """Show the whole conversation — every turn, not /context's last 20.
 
-def _cmd_context(app: "WheeljackApp", args: str) -> None:
+    With no argument this is the conversation in progress (read back from its
+    session file when there is one, so turns trimmed out of the live context
+    still appear); `/history NAME` prints a saved session instead. The argument
+    accepts a session name or the id shown in the header, matching --history.
+    """
+    sessions_dir = getattr(app.config, "sessions_dir", None)
+    name = args.strip()
+
+    if name:
+        if sessions_dir is None:
+            app.log("sessions disabled; no saved history to show")
+            return
+        found = _find_session_file(Path(sessions_dir), name, match_id=True)
+        if found is None:
+            app.log(f"no saved session named '{name}' "
+                    "(see /sessions for the list)")
+            return
+        path, data = found
+        app.log("\n".join(_session_history_lines(path, data)))
+        return
+
     agent = app.agent
-    if agent is None:
+    sc = getattr(agent, "session_context", None) if agent else None
+    rows: List[Dict[str, Any]] = []
+    if sc is not None:
+        rows = _saved_rows_for(sessions_dir, sc.session_id)
+    if not rows and agent is not None:
+        # No saved copy yet (first turn in flight) or sessions are off.
+        rows = [v for v in (_message_view(m)
+                            for m in getattr(agent, "messages", [])) if v]
+    if not rows:
         app.log("no conversation yet")
         return
-    past = [m for m in getattr(agent, "messages", [])
-            if m.role in ("user", "assistant") and m.content
-            and m.content != "(no response)"
-            and not m.content.startswith("(system)")]
-    if not past:
-        app.log("no conversation yet")
-        return
-    lines = []
-    for m in past[-20:]:
-        who = "you" if m.role == "user" else "wheeljack"
-        text = m.content.strip().replace("\n", " ")
-        if len(text) > 300:
-            text = text[:300] + "…"
-        lines.append(f"  {who}: {text}")
-    app.log("conversation context:\n" + "\n".join(lines))
+    meta = {"name": sc.name, "session_id": sc.session_id,
+            "created": (sc.created_at or "")[:10],
+            "last_used": (sc.last_accessed or "")[:10]} if sc else None
+    app.log("\n".join(history_lines(rows, meta=meta)))
 
 
 def _cmd_sessions(app: "WheeljackApp", args: str) -> None:
@@ -1221,6 +1541,43 @@ def ensure_home(home: Optional[Path] = None) -> Path:
     (home / "plugins").mkdir(parents=True, exist_ok=True)
     (home / "sessions").mkdir(parents=True, exist_ok=True)
     return home
+
+
+def print_history(sessions_dir: Path, name: str,
+                  out: Callable[[str], None] = print) -> int:
+    """Print a saved conversation (`--history NAME`) and return an exit code.
+
+    ``name`` may be a session name, its id/filename, or "__last__" for the most
+    recently used session — the shell has no renderer yet, so this prints
+    directly. Returns 1 when there is nothing to show.
+    """
+    name = (name or "").strip() or "__last__"
+    if name == "__last__":
+        found = None
+        sessions_dir = Path(sessions_dir)
+        files = sorted(sessions_dir.glob("*.json"),
+                       key=lambda p: p.stat().st_mtime,
+                       reverse=True) if sessions_dir.is_dir() else []
+        for session_file in files:
+            try:
+                data = json.loads(session_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            found = (session_file, data)
+            break
+        if found is None:
+            out(f"no saved conversations (stored in {sessions_dir}).")
+            return 1
+    else:
+        found = _find_session_file(Path(sessions_dir), name, match_id=True)
+        if found is None:
+            out(f"no saved conversation matching '{name}' "
+                f"(stored in {sessions_dir}).")
+            return 1
+    path, data = found
+    for line in _session_history_lines(path, data):
+        out(line)
+    return 0
 
 
 def _http_get(url: str, timeout: int = 30) -> bytes:
@@ -1802,6 +2159,7 @@ class WheeljackApp:
         self.add_slash_command("plugins", _cmd_plugins)
         self.add_slash_command("model", _cmd_model)
         self.add_slash_command("context", _cmd_context)
+        self.add_slash_command("history", _cmd_history)
         self.add_slash_command("sessions", _cmd_sessions)
         self.add_slash_command("reasoning", _cmd_reasoning)
 
@@ -2071,7 +2429,7 @@ class LLMClient:
         Keeps the system prompt, the most recent N messages, and never splits
         an assistant tool_call block away from the tool results that follow it.
         """
-        MAX_HISTORY = 100
+        MAX_HISTORY = MAX_CONTEXT_MESSAGES
         if len(messages) <= MAX_HISTORY:
             return messages
         keep = list(messages[-MAX_HISTORY:])
@@ -2731,7 +3089,7 @@ def _load_config(defaults: Dict[str, Any], home: Path) -> Config:
         except Exception:
             data = {}
         for key in ("model", "api_base", "api_key", "plugin_repo",
-                    "max_iterations", "request_timeout"):
+                    "max_iterations", "request_timeout", "context_window"):
             if data.get(key) is not None:
                 setattr(config, key, data[key])
     for key, value in defaults.items():
@@ -2748,6 +3106,10 @@ def main() -> None:
                         help="OpenAI-compatible API base, e.g. http://localhost:11434/v1")
     parser.add_argument("--session", nargs="?", const="__list__", default=None,
                         help="session name to load; bare --session lists saved sessions")
+    parser.add_argument("--history", nargs="?", const="__last__", metavar="NAME",
+                        default=None,
+                        help="print a saved conversation and exit; bare --history "
+                             "shows the most recently used session")
     parser.add_argument("--cwd", default=None, help="working directory for tools")
     parser.add_argument("-p", "--prompt", default=None,
                         help="non-interactive mode: run a single prompt and exit")
@@ -2774,6 +3136,10 @@ def main() -> None:
                         help="stream reasoning inline instead of a collapsed counter")
     parser.add_argument("--no-parallel", dest="no_parallel", action="store_true",
                         help="serialize read-only tools too")
+    parser.add_argument("--context-window", dest="context_window", type=int,
+                        default=None,
+                        help="model context window in tokens, used as /context's "
+                             "denominator (default: config.json or 32768)")
     parser.add_argument("--install", metavar="NAME|URL", default=None,
                         help="install a plugin from the repo (checksum + confirm)")
     parser.add_argument("--uninstall", metavar="NAME", default=None,
@@ -2800,6 +3166,8 @@ def main() -> None:
         for line in _sessions_table(home / "sessions"):
             print(line)
         return
+    if args.history is not None:
+        sys.exit(print_history(home / "sessions", args.history))
     if args.list_plugins:
         for line in list_plugins(Path(args.plugins), home=home, repo_base=repo):
             print(line)
@@ -2849,6 +3217,7 @@ def main() -> None:
         "non_interactive": args.prompt is not None,
         "tool_parallel_reads": not args.no_parallel,
         "show_reasoning": args.show_reasoning,
+        "context_window": args.context_window,
         "plugin_repo": args.plugin_repo,
         "agents_md_enabled": agents_md_enabled,
         "agents_md_file": agents_md_file,
